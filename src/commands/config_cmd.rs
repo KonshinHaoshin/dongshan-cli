@@ -38,6 +38,8 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             auto_exec_deny,
             auto_confirm_exec,
             auto_exec_trusted,
+            history_max_messages,
+            history_max_chars,
         } => {
             let mut cfg = load_config_or_default()?;
             if let Some(v) = model {
@@ -77,6 +79,12 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             }
             if let Some(v) = auto_exec_trusted {
                 cfg.auto_exec_trusted = parse_csv_list(&v);
+            }
+            if let Some(v) = history_max_messages {
+                cfg.history_max_messages = v.max(4);
+            }
+            if let Some(v) = history_max_chars {
+                cfg.history_max_chars = v.max(2000);
             }
             ensure_model_catalog(&mut cfg);
             save_config(&cfg)?;

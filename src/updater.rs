@@ -44,10 +44,20 @@ pub async fn maybe_check_update(cfg: &Config) -> Result<()> {
     save_state(&state)?;
 
     if is_remote_newer(current, &latest) {
+        println!("Update available: {} -> {}", current, latest);
         println!(
-            "Update available: {} -> {}\nRun: cargo install --git https://github.com/{}/{} --force",
-            current, latest, REPO_OWNER, REPO_NAME
+            "Release page: https://github.com/{}/{}/releases/latest",
+            REPO_OWNER, REPO_NAME
         );
+        if cfg!(target_os = "windows") {
+            println!("Windows installer asset: dongshan-setup-windows-x86_64.exe");
+            println!("Portable zip asset: dongshan-windows-x86_64.zip");
+        } else {
+            println!(
+                "Or run: cargo install --git https://github.com/{}/{} --force",
+                REPO_OWNER, REPO_NAME
+            );
+        }
     }
 
     Ok(())

@@ -16,6 +16,10 @@
 - 仅对 `bash/sh/powershell/pwsh/cmd` 代码块做命令执行解析
 - 对“非默认信任命令”执行前询问，可一键设为默认信任前缀
 - 启动自动检查更新（GitHub）
+- 按模型独立 profile（`base_url` / `api_key_env` / `api_key`），支持自定义 OpenAI 兼容网关
+- `dongshan doctor` 当前模型健康检查
+- 结构化 JSON tool-call 自动执行（不再自动执行传统 shell 代码块）
+- 聊天历史自动压缩（按消息数和字符预算）
 
 ## 构建
 
@@ -29,6 +33,40 @@ cargo build --release
 cargo install --path .
 dongshan --help
 ```
+
+## Windows 安装包（Setup EXE）
+
+给普通用户推荐直接用 Release 安装包：
+
+- `dongshan-setup-windows-x86_64.exe`（推荐）
+- `dongshan-windows-x86_64.zip`（便携版）
+
+安装后重新打开 PowerShell，执行：
+
+```powershell
+dongshan --help
+```
+
+## Release 自动打包
+
+仓库已内置 Windows 自动打包发布：
+
+- Workflow：`.github/workflows/release.yml`
+- Inno 安装脚本：`packaging/windows/dongshan.iss`
+- 本地打包脚本：`scripts/build-installer.ps1`
+
+发布新版本（打 tag）：
+
+```powershell
+git tag v0.1.4
+git push origin v0.1.4
+```
+
+GitHub Actions 会自动上传：
+
+- `dongshan-setup-windows-x86_64.exe`
+- `dongshan-windows-x86_64.zip`
+- `SHA256SUMS.txt`
 
 ## 快速开始
 
@@ -181,11 +219,7 @@ dongshan config set --auto-exec-trusted "rg,grep,git status"
 
 - 更新源：`https://github.com/KonshinHaoshin/dongshan-cli`
 - 默认每 24 小时检查一次
-- 检测到新版本会提示：
-
-```powershell
-cargo install --git https://github.com/KonshinHaoshin/dongshan-cli --force
-```
+- 检测到新版本会提示 Release 页面和对应安装包资产名称。
 
 关闭自动检查：
 
@@ -221,4 +255,46 @@ dongshan models list
 dongshan models add grok-code-fast-1
 dongshan models use grok-code-fast-1
 dongshan models remove old-model-name
+dongshan models show
+dongshan models show grok-code-fast-1
+dongshan models set-profile grok-code-fast-1 --base-url "https://api.x.ai/v1/chat/completions" --api-key-env "XAI_API_KEY"
+```
+
+自定义模型（自定义 API 地址和 Key 环境变量）：
+
+```powershell
+dongshan models add my-openai-compatible `
+  --base-url "https://your-gateway.example.com/v1/chat/completions" `
+  --api-key-env "MY_GATEWAY_KEY"
+dongshan models use my-openai-compatible
+```
+
+## Doctor 健康检查
+
+```powershell
+dongshan doctor
+```
+
+检查内容：
+
+- 当前模型 profile 是否存在
+- `base_url` 是否有效
+- API key 是否可解析
+- `/models` 是否可达（不支持时给 warning）
+- 实际 chat completion 连通性
+
+## Chat 执行协议
+
+- 自动执行只解析 JSON tool-call：
+
+```json
+{"tool_calls":[{"tool":"shell","command":"rg --files"}]}
+```
+
+- 传统 `bash/powershell` 代码块不会再被自动执行。
+
+## 会话压缩参数
+
+```powershell
+dongshan config set --history-max-messages 24 --history-max-chars 50000
 ```

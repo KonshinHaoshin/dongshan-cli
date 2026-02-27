@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     AutoExecMode, add_model_with_active_profile, ensure_model_catalog, load_config_or_default,
-    remove_model, save_config, set_active_model, update_active_model_profile,
+    remove_model, save_config, set_active_model, update_active_model_profile, upsert_model_profile,
 };
 use crate::prompt_store::{list_prompts, remove_prompt, save_prompt};
 
@@ -139,6 +139,9 @@ async fn api_prompt_delete(Json(req): Json<PromptDeleteRequest>) -> ApiResult<Js
 async fn api_model_add(Json(req): Json<ModelAddRequest>) -> ApiResult<Json<SimpleOk>> {
     let mut cfg = load_config_or_default().map_err(api_err)?;
     add_model_with_active_profile(&mut cfg, &req.name);
+    if req.base_url.is_some() || req.api_key_env.is_some() || req.api_key.is_some() {
+        upsert_model_profile(&mut cfg, &req.name, req.base_url, req.api_key_env, req.api_key);
+    }
     save_config(&cfg).map_err(api_err)?;
     Ok(Json(SimpleOk { ok: true }))
 }
@@ -248,6 +251,9 @@ struct PromptDeleteRequest {
 #[derive(Debug, Deserialize)]
 struct ModelAddRequest {
     name: String,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

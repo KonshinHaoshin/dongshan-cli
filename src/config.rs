@@ -63,6 +63,10 @@ pub struct Config {
     pub auto_confirm_exec: bool,
     #[serde(default)]
     pub auto_exec_trusted: Vec<String>,
+    #[serde(default = "default_history_max_messages")]
+    pub history_max_messages: usize,
+    #[serde(default = "default_history_max_chars")]
+    pub history_max_chars: usize,
     #[serde(default)]
     pub model_catalog: Vec<String>,
 }
@@ -96,6 +100,8 @@ impl Default for Config {
             auto_exec_deny: Vec::new(),
             auto_confirm_exec: true,
             auto_exec_trusted: vec!["rg".to_string(), "grep".to_string()],
+            history_max_messages: default_history_max_messages(),
+            history_max_chars: default_history_max_chars(),
             model_catalog: vec![model],
         }
     }
@@ -119,6 +125,14 @@ fn default_auto_exec_mode() -> AutoExecMode {
 
 fn default_auto_confirm_exec() -> bool {
     true
+}
+
+fn default_history_max_messages() -> usize {
+    24
+}
+
+fn default_history_max_chars() -> usize {
+    50_000
 }
 
 pub fn default_prompts() -> BTreeMap<String, String> {
@@ -379,6 +393,53 @@ pub fn remove_model(cfg: &mut Config, model: &str) -> bool {
     removed
 }
 
+pub fn upsert_model_profile(
+    cfg: &mut Config,
+    model: &str,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
+    api_key: Option<String>,
+) {
+    let name = model.trim();
+    if name.is_empty() {
+        return;
+    }
+    add_model_with_active_profile(cfg, name);
+
+    let mut p = cfg
+        .model_profiles
+        .get(name)
+        .cloned()
+        .unwrap_or(ModelProfile {
+            base_url: cfg.base_url.clone(),
+            api_key_env: cfg.api_key_env.clone(),
+            api_key: cfg.api_key.clone(),
+        });
+
+    if let Some(v) = base_url
+        && !v.trim().is_empty()
+    {
+        p.base_url = v;
+    }
+    if let Some(v) = api_key_env
+        && !v.trim().is_empty()
+    {
+        p.api_key_env = v;
+    }
+    if let Some(v) = api_key {
+        if v.trim().is_empty() {
+            p.api_key = None;
+        } else {
+            p.api_key = Some(v);
+        }
+    }
+
+    cfg.model_profiles.insert(name.to_string(), p);
+    if cfg.model == name {
+        apply_active_model_profile(cfg);
+    }
+}
+
 pub fn resolve_api_key(cfg: &Config) -> Result<String> {
     if let Some(p) = cfg.model_profiles.get(&cfg.model) {
         if let Ok(v) = env::var(&p.api_key_env) {
@@ -433,10 +494,11 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are a careful code editor.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
+        prompt.push_str("\nIf terminal execution is needed, output structured JSON tool calls only.");
         prompt.push_str(
-            "\nWhen proposing executable terminal commands, use fenced ```bash``` or ```powershell``` blocks only.",
+            "\nFormat: ```json {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]} ```",
         );
-        prompt.push_str("\nDo not use ```python``` blocks for shell commands.");
+        prompt.push_str("\nDo not output bash/powershell/python command blocks for auto execution.");
     }
     if cfg.allow_nsfw {
         prompt.push_str(

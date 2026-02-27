@@ -42,6 +42,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Diagnose current model/profile/network health
+    Doctor,
     /// Basic file system tools (read/list/grep)
     Fs {
         #[command(subcommand)]
@@ -110,6 +112,12 @@ pub enum ConfigCommand {
         /// Comma-separated trusted command prefixes, e.g. "rg,grep,git status"
         #[arg(long)]
         auto_exec_trusted: Option<String>,
+        /// Maximum number of chat messages kept before compaction
+        #[arg(long)]
+        history_max_messages: Option<usize>,
+        /// Maximum total chat characters kept before compaction
+        #[arg(long)]
+        history_max_chars: Option<usize>,
     },
 }
 
@@ -157,8 +165,31 @@ pub enum ModelsCommand {
     /// Use one model as current active model
     Use { name: String },
     /// Add a model to local catalog
-    Add { name: String },
+    Add {
+        name: String,
+        /// Optional custom base URL for this model profile
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Optional env var name for API key of this model profile
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// Optional API key stored in config for this model profile
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Remove a model from local catalog
     Remove { name: String },
+    /// Show one model profile (or current model when omitted)
+    Show { name: Option<String> },
+    /// Set profile for one model
+    SetProfile {
+        name: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 }
 

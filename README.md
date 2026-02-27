@@ -19,6 +19,10 @@
 - Ask before running non-trusted commands, with "always trust this prefix" option
 - Auto update check from GitHub on startup
 - Real-time progress line in terminal (e.g. `(working model gpt-4o-mini 8s)`)
+- Per-model profile (`base_url` / `api_key_env` / `api_key`) for custom OpenAI-compatible endpoints
+- `dongshan doctor` health check for current model profile
+- Structured JSON tool-call execution (no legacy shell block auto-exec)
+- Automatic chat history compaction (message and character budget)
 
 ## Build
 
@@ -39,6 +43,40 @@ If command is not found, add Cargo bin to PATH:
 $cargoBin = "$HOME\\.cargo\\bin"
 [Environment]::SetEnvironmentVariable("Path", $env:Path + ";" + $cargoBin, "User")
 ```
+
+## Windows Setup EXE
+
+For normal users, use the installer from GitHub Releases:
+
+- `dongshan-setup-windows-x86_64.exe` (recommended)
+- `dongshan-windows-x86_64.zip` (portable)
+
+After installation, open a new PowerShell and run:
+
+```powershell
+dongshan --help
+```
+
+## Release Packaging
+
+This repo includes automated packaging for Windows setup:
+
+- Workflow: `.github/workflows/release.yml`
+- Inno script: `packaging/windows/dongshan.iss`
+- Local build script: `scripts/build-installer.ps1`
+
+Publish a new release by pushing a tag:
+
+```powershell
+git tag v0.1.4
+git push origin v0.1.4
+```
+
+GitHub Actions will build and upload:
+
+- `dongshan-setup-windows-x86_64.exe`
+- `dongshan-windows-x86_64.zip`
+- `SHA256SUMS.txt`
 
 ## Quick Start
 
@@ -190,11 +228,7 @@ dongshan config set --auto-exec-trusted "rg,grep,git status"
 
 - Source repo: `https://github.com/KonshinHaoshin/dongshan-cli`
 - Checks about every 24 hours by default.
-- On newer version, it prints:
-
-```powershell
-cargo install --git https://github.com/KonshinHaoshin/dongshan-cli --force
-```
+- On newer version, it prints release page and asset hints.
 
 Disable:
 
@@ -240,5 +274,49 @@ dongshan models list
 dongshan models add grok-code-fast-1
 dongshan models use grok-code-fast-1
 dongshan models remove old-model-name
+dongshan models show
+dongshan models show grok-code-fast-1
+dongshan models set-profile grok-code-fast-1 --base-url "https://api.x.ai/v1/chat/completions" --api-key-env "XAI_API_KEY"
+```
+
+Custom model with custom endpoint/key:
+
+```powershell
+dongshan models add my-openai-compatible \
+  --base-url "https://your-gateway.example.com/v1/chat/completions" \
+  --api-key-env "MY_GATEWAY_KEY"
+dongshan models use my-openai-compatible
+```
+
+## Doctor
+
+```powershell
+dongshan doctor
+```
+
+Checks:
+
+- Current model profile exists
+- `base_url` validity
+- API key resolution
+- `/models` endpoint reachability (warning-only if unsupported)
+- Real chat completion request health
+
+## Chat Execution Protocol
+
+- Auto execution only parses JSON tool-call blocks:
+
+```json
+{"tool_calls":[{"tool":"shell","command":"rg --files"}]}
+```
+
+- Legacy `bash/powershell` blocks are ignored for auto execution.
+
+## Session Compaction
+
+Tune chat memory budget:
+
+```powershell
+dongshan config set --history-max-messages 24 --history-max-chars 50000
 ```
 

@@ -101,8 +101,17 @@ const ProviderPage = {
 };
 
 const ModelsPage = {
-  props: ["state", "selectedModel", "newModelName"],
-  emits: ["update:selectedModel", "update:newModelName", "add-model", "use-model", "remove-model"],
+  props: ["state", "selectedModel", "newModelName", "newModelBaseUrl", "newModelApiKeyEnv", "newModelApiKey"],
+  emits: [
+    "update:selectedModel",
+    "update:newModelName",
+    "update:newModelBaseUrl",
+    "update:newModelApiKeyEnv",
+    "update:newModelApiKey",
+    "add-model",
+    "use-model",
+    "remove-model",
+  ],
   template: `
     <section>
       <div class="grid">
@@ -112,6 +121,11 @@ const ModelsPage = {
             <label>Current model <input :value="state.config.model" disabled /></label>
             <label>Add model <input :value="newModelName" @input="$emit('update:newModelName', $event.target.value)" placeholder="grok-code-fast-1" /></label>
           </div>
+          <div class="row2">
+            <label>Custom base_url (optional) <input :value="newModelBaseUrl" @input="$emit('update:newModelBaseUrl', $event.target.value)" placeholder="https://api.openai.com/v1/chat/completions" /></label>
+            <label>Custom api_key_env (optional) <input :value="newModelApiKeyEnv" @input="$emit('update:newModelApiKeyEnv', $event.target.value)" placeholder="OPENAI_API_KEY" /></label>
+          </div>
+          <label>Custom api_key (optional) <input type="password" :value="newModelApiKey" @input="$emit('update:newModelApiKey', $event.target.value)" /></label>
           <label>Catalog
             <select :value="selectedModel" @change="$emit('update:selectedModel', $event.target.value)" size="9">
               <option v-for="m in state.config.model_catalog" :key="m" :value="m">{{ m }}</option>
@@ -275,6 +289,9 @@ createApp({
 
     const selectedModel = ref("");
     const newModelName = ref("");
+    const newModelBaseUrl = ref("");
+    const newModelApiKeyEnv = ref("");
+    const newModelApiKey = ref("");
     const selectedPrompt = ref("");
     const promptDraft = ref({ name: "", content: "" });
 
@@ -390,8 +407,16 @@ createApp({
     async function addModel() {
       const name = newModelName.value.trim();
       if (!name) return;
-      await call("/api/model/add", "POST", { name });
+      await call("/api/model/add", "POST", {
+        name,
+        base_url: newModelBaseUrl.value.trim() || null,
+        api_key_env: newModelApiKeyEnv.value.trim() || null,
+        api_key: newModelApiKey.value || null,
+      });
       newModelName.value = "";
+      newModelBaseUrl.value = "";
+      newModelApiKeyEnv.value = "";
+      newModelApiKey.value = "";
       await refresh();
       toast("model added");
     }
@@ -473,6 +498,9 @@ createApp({
       policyForm,
       selectedModel,
       newModelName,
+      newModelBaseUrl,
+      newModelApiKeyEnv,
+      newModelApiKey,
       selectedPrompt,
       promptDraft,
       statusLine,
@@ -513,8 +541,14 @@ createApp({
           :state="state"
           :selected-model="selectedModel"
           :new-model-name="newModelName"
+          :new-model-base-url="newModelBaseUrl"
+          :new-model-api-key-env="newModelApiKeyEnv"
+          :new-model-api-key="newModelApiKey"
           @update:selected-model="selectedModel = $event"
           @update:new-model-name="newModelName = $event"
+          @update:new-model-base-url="newModelBaseUrl = $event"
+          @update:new-model-api-key-env="newModelApiKeyEnv = $event"
+          @update:new-model-api-key="newModelApiKey = $event"
           @add-model="addModel"
           @use-model="useModel"
           @remove-model="removeModel"
