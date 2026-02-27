@@ -11,6 +11,7 @@
 - Onboard model picker by provider (numbered choices + custom input)
 - Onboard can fetch online model list (fallback to built-in options if unavailable)
 - Prompt profiles + variables
+- Local web console for managing config/models/prompts/policy (`dongshan web`)
 - Chat with natural-language tool routing
 - Slash commands in chat (`/new`, `/read`, `/grep`, etc.)
 - Agent loop: auto-run commands based on your policy (`safe`/`all`/`custom`)
@@ -46,7 +47,41 @@ dongshan config init
 dongshan onboard
 dongshan config set --auto-check-update true
 dongshan chat
+dongshan web --port 3721
 ```
+
+## Web Console
+
+Start local console:
+
+```powershell
+dongshan web --port 3721
+```
+
+Open in browser:
+
+- `http://127.0.0.1:3721`
+
+Usage:
+
+```powershell
+# 1) Start server
+dongshan web --port 3721
+
+# 2) Keep this terminal running, then open browser
+http://127.0.0.1:3721
+```
+
+You can manage:
+
+- Provider/API fields (`base_url`, `api_key_env`, `api_key`, `allow_nsfw`)
+- Model catalog (add/use/remove)
+- Per-model connection profile: each model has its own `base_url` / `api_key_env` / `api_key`
+- Prompt files (save/use/delete)
+- Auto exec policy (`safe/all/custom`, allow/deny/trusted, confirm flag)
+- Frontend is split into static files: `web/index.html`, `web/app.css`, `web/app.js`
+- UI uses Vue component architecture (loaded from CDN in `index.html`)
+- `onboard` only saves the model you selected (it no longer bulk-adds all suggested models)
 
 ## Chat
 
@@ -108,6 +143,18 @@ Natural language in chat:
 
 ```text
 切换prompt reviewer
+```
+
+Prompt storage location:
+
+- `~/.dongshan/prompts/*.json`
+- Each prompt is a separate JSON file, for example:
+
+```json
+{
+  "name": "reviewer",
+  "content": "You are a strict code reviewer. Focus on bugs and missing tests."
+}
 ```
 
 ## Auto Exec Policy

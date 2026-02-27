@@ -9,14 +9,15 @@ use anyhow::{Context, Result};
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
     AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text, ensure_model_catalog,
-    save_config,
+    save_config, set_active_model,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
     try_rg_files, try_rg_grep,
 };
 use crate::llm::{ChatMessage, call_llm_with_history};
-use crate::util::{WorkingStatus, ask, truncate_preview};
+use crate::prompt_store::list_prompt_names;
+use crate::util::{WorkingStatus, ask, prefix_chars, truncate_preview, truncate_with_suffix};
 const MAX_AUTO_TOOL_STEPS: usize = 3;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
@@ -76,8 +77,13 @@ async fn handle_natural_language_tool_command(
     if is_prompt_list_request(input, &lower) {
         let mut out = String::new();
         out.push_str(&format!("Active: {}\n", cfg.active_prompt));
-        for (name, text) in &cfg.prompts {
-            out.push_str(&format!("- {}: {}\n", name, truncate_preview(text, 90)));
+        for name in list_prompt_names().unwrap_or_default() {
+            let preview = if name == cfg.active_prompt {
+                truncate_preview(&current_prompt_text(cfg), 90)
+            } else {
+                "(stored)".to_string()
+            };
+            out.push_str(&format!("- {}: {}\n", name, preview));
         }
         println!("{out}");
         push_tool_result(history, input, "prompt.list", &out);
@@ -85,7 +91,7 @@ async fn handle_natural_language_tool_command(
     }
 
     if let Some(name) = parse_prompt_use(input, &lower) {
-        if !cfg.prompts.contains_key(&name) {
+        if !list_prompt_names().unwrap_or_default().iter().any(|p| p == &name) {
             println!("Prompt not found: {name}");
             return Ok(true);
         }
@@ -121,7 +127,7 @@ async fn handle_natural_language_tool_command(
             println!("Model not found in catalog: {}", name);
             return Ok(true);
         }
-        cfg.model = name.clone();
+        set_active_model(cfg, &name);
         save_config(cfg)?;
         let out = format!("Active model switched to '{}'.", name);
         println!("{out}");
@@ -201,11 +207,7 @@ fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str
 }
 
 fn clip_output(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...\n[truncated]", &text[..max_len])
-    }
+    truncate_with_suffix(text, max_len, "...\n[truncated]")
 }
 
 fn is_read_request(input: &str, lower: &str) -> bool {
@@ -470,8 +472,12 @@ fn handle_chat_slash_command(
                 }
                 "list" => {
                     println!("Active: {}", cfg.active_prompt);
-                    for (name, text) in &cfg.prompts {
-                        println!("- {}: {}", name, truncate_preview(text, 90));
+                    for name in list_prompt_names().unwrap_or_default() {
+                        if name == cfg.active_prompt {
+                            println!("- {}: {}", name, truncate_preview(&current_prompt_text(cfg), 90));
+                        } else {
+                            println!("- {}: (stored)", name);
+                        }
                     }
                 }
                 "use" => {
@@ -479,7 +485,7 @@ fn handle_chat_slash_command(
                         println!("Usage: /prompt use <name>");
                         return Ok(());
                     };
-                    if !cfg.prompts.contains_key(name) {
+                    if !list_prompt_names().unwrap_or_default().iter().any(|p| p == name) {
                         println!("Prompt not found: {name}");
                         return Ok(());
                     }
@@ -515,7 +521,7 @@ fn handle_chat_slash_command(
                         println!("Model not in catalog: {}", name);
                         return Ok(());
                     }
-                    cfg.model = name.to_string();
+                    set_active_model(cfg, name);
                     save_config(cfg)?;
                     println!("Active model switched to '{}'.", name);
                 }
@@ -883,8 +889,8 @@ fn is_safe_auto_exec_command(cmd: &str) -> bool {
 }
 
 fn run_shell_command(cmd: &str) -> Result<String> {
-    let short = if cmd.len() > 48 {
-        format!("exec {}...", &cmd[..48])
+    let short = if cmd.chars().count() > 48 {
+        format!("exec {}...", prefix_chars(cmd, 48))
     } else {
         format!("exec {}", cmd)
     };

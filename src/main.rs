@@ -5,8 +5,10 @@ mod commands;
 mod config;
 mod fs_tools;
 mod llm;
+mod prompt_store;
 mod updater;
 mod util;
+mod webui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,6 +20,7 @@ use crate::commands::{
 };
 use crate::config::load_config_or_default;
 use crate::updater::maybe_check_update;
+use crate::webui::run_web;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,6 +34,7 @@ async fn main() -> Result<()> {
             let cfg = load_config_or_default()?;
             run_chat(cfg, &session).await?;
         }
+        Commands::Web { port } => run_web(port).await?,
         Commands::Config { command } => handle_config(command)?,
         Commands::Prompt { command } => handle_prompt(command)?,
         Commands::Models { command } => handle_models(command)?,

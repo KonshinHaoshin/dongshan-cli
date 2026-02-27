@@ -9,6 +9,7 @@
 - onboard 按 provider 提供模型候选（编号选择 + 自定义输入）
 - onboard 会尝试在线拉取模型列表（失败自动回退内置候选）
 - Prompt 保存、切换、变量模板
+- 本地 Web 控制台（`dongshan web`）管理配置/模型/Prompt/执行策略
 - `chat` 自然语言工具路由
 - `/new`、`/read`、`/grep` 等斜杠命令
 - Agent 循环：根据策略自动执行命令块并回喂模型
@@ -36,7 +37,42 @@ dongshan config init
 dongshan onboard
 dongshan config set --auto-check-update true
 dongshan chat
+dongshan web --port 3721
 ```
+
+## Web 控制台
+
+启动：
+
+```powershell
+dongshan web --port 3721
+```
+
+浏览器打开：
+
+- `http://127.0.0.1:3721`
+
+使用方法：
+
+```powershell
+# 1) 启动 Web 服务
+dongshan web --port 3721
+
+# 2) 保持这个终端窗口运行，然后在浏览器访问
+http://127.0.0.1:3721
+```
+
+可管理内容：
+
+- Provider/API 配置（`base_url`、`api_key_env`、`api_key`、`allow_nsfw`）
+- 模型目录（新增/切换/删除）
+- 按模型独立配置连接信息：每个模型各自维护 `base_url` / `api_key_env` / `api_key`
+- Prompt 文件（保存/切换/删除）
+- 自动执行策略（`safe/all/custom`、allow/deny/trusted、确认开关）
+
+说明：
+
+- `onboard` 现在只保存你最终选择的模型，不会把候选列表全部加入模型目录。
 
 ## Chat
 
@@ -98,6 +134,18 @@ dongshan prompt var-list
 
 ```text
 切换prompt reviewer
+```
+
+Prompt 存储位置：
+
+- `~/.dongshan/prompts/*.json`
+- 每个 prompt 一个 JSON 文件，例如：
+
+```json
+{
+  "name": "reviewer",
+  "content": "你是严格代码审查员，优先找 bug 和缺失测试。"
+}
 ```
 
 ## 命令自动执行策略

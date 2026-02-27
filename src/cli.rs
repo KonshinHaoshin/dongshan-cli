@@ -21,6 +21,12 @@ pub enum Commands {
         #[arg(long, default_value = "default")]
         session: String,
     },
+    /// Local web console for prompt/model/policy management
+    Web {
+        /// Listen port
+        #[arg(long, default_value_t = 3721)]
+        port: u16,
+    },
     /// Manage API settings
     Config {
         #[command(subcommand)]

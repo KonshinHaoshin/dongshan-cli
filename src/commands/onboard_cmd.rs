@@ -7,9 +7,11 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::config::{
-    AutoExecMode, Config, ProviderPreset, apply_preset, config_path, ensure_model_catalog,
-    load_config_or_default, provider_model_options, save_config,
+    AutoExecMode, Config, ProviderPreset, add_model_with_active_profile, apply_preset, config_path,
+    load_config_or_default, provider_model_options, save_config, set_active_model,
+    update_active_model_profile,
 };
+use crate::prompt_store::{list_prompt_names, save_prompt};
 use crate::util::ask;
 
 pub async fn run_onboard() -> Result<()> {
@@ -58,16 +60,21 @@ pub async fn run_onboard() -> Result<()> {
     println!("0) custom input");
     let model_choice = ask(&format!("Model option [0-{}] (default 1): ", model_options.len()))?;
     let choice_num = model_choice.trim().parse::<usize>().unwrap_or(1);
-    if choice_num == 0 {
+    let selected_model = if choice_num == 0 {
         let model = ask(&format!("Model (default {}): ", cfg.model))?;
         if !model.trim().is_empty() {
-            cfg.model = model.trim().to_string();
+            model.trim().to_string()
+        } else {
+            cfg.model.clone()
         }
     } else if choice_num <= model_options.len() {
-        cfg.model = model_options[choice_num - 1].to_string();
-    }
-    cfg.model_catalog = merge_unique(cfg.model_catalog, model_options.clone());
-    ensure_model_catalog(&mut cfg);
+        model_options[choice_num - 1].to_string()
+    } else {
+        cfg.model.clone()
+    };
+    set_active_model(&mut cfg, &selected_model);
+    add_model_with_active_profile(&mut cfg, &selected_model);
+    update_active_model_profile(&mut cfg);
 
     let nsfw = ask("Allow NSFW in dongshan local prompt flow? [Y/n]: ")?;
     if matches!(nsfw.trim().to_lowercase().as_str(), "n" | "no" | "0" | "false") {
@@ -88,19 +95,20 @@ pub async fn run_onboard() -> Result<()> {
     };
 
     println!("\nPrompt profile name to use (default):");
+    let prompt_names = list_prompt_names().unwrap_or_else(|_| vec!["default".to_string()]);
     println!(
         "Existing: {}",
-        cfg.prompts.keys().cloned().collect::<Vec<_>>().join(", ")
+        prompt_names.join(", ")
     );
     let active_name = ask(&format!("Active prompt name (default {}): ", cfg.active_prompt))?;
     if !active_name.trim().is_empty() {
         let name = active_name.trim().to_string();
-        if !cfg.prompts.contains_key(&name) {
+        if !prompt_names.iter().any(|p| p == &name) {
             let text = ask(&format!("Prompt '{}' text: ", name))?;
             if text.trim().is_empty() {
                 bail!("Prompt text cannot be empty for new prompt '{}'", name);
             }
-            cfg.prompts.insert(name.clone(), text);
+            save_prompt(&name, &text)?;
         }
         cfg.active_prompt = name;
     }
