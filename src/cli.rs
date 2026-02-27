@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::ProviderPreset;
+use crate::config::{AutoExecMode, ProviderPreset};
 
 #[derive(Parser, Debug)]
 #[command(name = "dongshan", version, about = "A simple AI coding CLI in Rust")]
@@ -30,6 +30,11 @@ pub enum Commands {
     Prompt {
         #[command(subcommand)]
         command: PromptCommand,
+    },
+    /// Manage available models and active model
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
     },
     /// Basic file system tools (read/list/grep)
     Fs {
@@ -81,6 +86,24 @@ pub enum ConfigCommand {
         /// Local content filter switch in dongshan (does not override provider policy)
         #[arg(long)]
         allow_nsfw: Option<bool>,
+        /// Automatically check new version on startup
+        #[arg(long)]
+        auto_check_update: Option<bool>,
+        /// Command auto-exec policy: safe | all | custom
+        #[arg(long, value_enum)]
+        auto_exec_mode: Option<AutoExecMode>,
+        /// Comma-separated allowlist for `custom` mode, e.g. "rg,ls,git status"
+        #[arg(long)]
+        auto_exec_allow: Option<String>,
+        /// Comma-separated denylist (highest priority), e.g. "rm,del,git reset"
+        #[arg(long)]
+        auto_exec_deny: Option<String>,
+        /// Ask before running non-trusted commands in chat
+        #[arg(long)]
+        auto_confirm_exec: Option<bool>,
+        /// Comma-separated trusted command prefixes, e.g. "rg,grep,git status"
+        #[arg(long)]
+        auto_exec_trusted: Option<String>,
     },
 }
 
@@ -119,5 +142,17 @@ pub enum FsCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelsCommand {
+    /// List saved model catalog and current active model
+    List,
+    /// Use one model as current active model
+    Use { name: String },
+    /// Add a model to local catalog
+    Add { name: String },
+    /// Remove a model from local catalog
+    Remove { name: String },
 }
 

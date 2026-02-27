@@ -2,8 +2,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::config::{Config, resolve_api_key};
+use crate::util::WorkingStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -24,6 +26,7 @@ pub async fn call_llm_with_history(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Result<String> {
+    let working = WorkingStatus::start(format!("model {}", cfg.model));
     let api_key = resolve_api_key(cfg)?;
     let mut messages = vec![json!({"role":"system","content":system_prompt})];
     for m in history {
@@ -35,7 +38,10 @@ pub async fn call_llm_with_history(
         "temperature": 0.2
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .context("failed to build HTTP client")?;
     let resp = client
         .post(&cfg.base_url)
         .bearer_auth(api_key)
@@ -53,6 +59,7 @@ pub async fn call_llm_with_history(
 
     let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
     let content = extract_content(&val).context("Cannot parse response content")?;
+    working.finish();
     Ok(content.trim().to_string())
 }
 
