@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::ProviderPreset;
+use crate::config::{AutoExecMode, ProviderPreset};
 
 #[derive(Parser, Debug)]
 #[command(name = "dongshan", version, about = "A simple AI coding CLI in Rust")]
@@ -81,6 +81,18 @@ pub enum ConfigCommand {
         /// Local content filter switch in dongshan (does not override provider policy)
         #[arg(long)]
         allow_nsfw: Option<bool>,
+        /// Automatically check new version on startup
+        #[arg(long)]
+        auto_check_update: Option<bool>,
+        /// Command auto-exec policy: safe | all | custom
+        #[arg(long, value_enum)]
+        auto_exec_mode: Option<AutoExecMode>,
+        /// Comma-separated allowlist for `custom` mode, e.g. "rg,ls,git status"
+        #[arg(long)]
+        auto_exec_allow: Option<String>,
+        /// Comma-separated denylist (highest priority), e.g. "rm,del,git reset"
+        #[arg(long)]
+        auto_exec_deny: Option<String>,
     },
 }
 

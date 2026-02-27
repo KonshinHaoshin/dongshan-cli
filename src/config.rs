@@ -12,6 +12,16 @@ pub enum ProviderPreset {
     Openai,
     Deepseek,
     Openrouter,
+    Xai,
+    Nvidia,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoExecMode {
+    Safe,
+    All,
+    Custom,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +39,14 @@ pub struct Config {
     pub prompt_vars: BTreeMap<String, String>,
     #[serde(default = "default_allow_nsfw")]
     pub allow_nsfw: bool,
+    #[serde(default = "default_auto_check_update")]
+    pub auto_check_update: bool,
+    #[serde(default = "default_auto_exec_mode")]
+    pub auto_exec_mode: AutoExecMode,
+    #[serde(default)]
+    pub auto_exec_allow: Vec<String>,
+    #[serde(default)]
+    pub auto_exec_deny: Vec<String>,
 }
 
 impl Default for Config {
@@ -42,6 +60,10 @@ impl Default for Config {
             active_prompt: default_active_prompt(),
             prompt_vars: BTreeMap::new(),
             allow_nsfw: true,
+            auto_check_update: true,
+            auto_exec_mode: AutoExecMode::Safe,
+            auto_exec_allow: Vec::new(),
+            auto_exec_deny: Vec::new(),
         }
     }
 }
@@ -52,6 +74,14 @@ fn default_active_prompt() -> String {
 
 fn default_allow_nsfw() -> bool {
     true
+}
+
+fn default_auto_check_update() -> bool {
+    true
+}
+
+fn default_auto_exec_mode() -> AutoExecMode {
+    AutoExecMode::Safe
 }
 
 pub fn default_prompts() -> BTreeMap<String, String> {
@@ -91,6 +121,35 @@ pub fn apply_preset(cfg: &mut Config, provider: ProviderPreset) {
             cfg.model = "openai/gpt-4o-mini".to_string();
             cfg.api_key_env = "OPENROUTER_API_KEY".to_string();
         }
+        ProviderPreset::Xai => {
+            cfg.base_url = "https://api.x.ai/v1/chat/completions".to_string();
+            cfg.model = "grok-2-latest".to_string();
+            cfg.api_key_env = "XAI_API_KEY".to_string();
+        }
+        ProviderPreset::Nvidia => {
+            cfg.base_url = "https://integrate.api.nvidia.com/v1/chat/completions".to_string();
+            cfg.model = "meta/llama-3.1-70b-instruct".to_string();
+            cfg.api_key_env = "NVIDIA_API_KEY".to_string();
+        }
+    }
+}
+
+pub fn provider_model_options(provider: ProviderPreset) -> Vec<&'static str> {
+    match provider {
+        ProviderPreset::Openai => vec!["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1", "o4-mini"],
+        ProviderPreset::Deepseek => vec!["deepseek-chat", "deepseek-reasoner"],
+        ProviderPreset::Openrouter => vec![
+            "openai/gpt-4o-mini",
+            "openai/gpt-4.1-mini",
+            "anthropic/claude-3.5-sonnet",
+            "meta-llama/llama-3.1-70b-instruct",
+        ],
+        ProviderPreset::Xai => vec!["grok-2-latest", "grok-2-1212"],
+        ProviderPreset::Nvidia => vec![
+            "meta/llama-3.1-70b-instruct",
+            "mistralai/mixtral-8x7b-instruct-v0.1",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+        ],
     }
 }
 

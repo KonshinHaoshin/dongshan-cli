@@ -1,5 +1,9 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -34,4 +38,64 @@ pub fn backup_path(file: &Path) -> PathBuf {
         format!("{stem}.bak.{ext}")
     };
     file.with_file_name(file_name)
+}
+
+pub struct WorkingStatus {
+    label: String,
+    start: Instant,
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    finished: bool,
+}
+
+impl WorkingStatus {
+    pub fn start(label: impl Into<String>) -> Self {
+        let label = label.into();
+        let start = Instant::now();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_flag = Arc::clone(&done);
+        let label_for_thread = label.clone();
+
+        let handle = thread::spawn(move || {
+            while !done_flag.load(Ordering::Relaxed) {
+                let secs = start.elapsed().as_secs();
+                print!("\r(working {} {}s)", label_for_thread, secs);
+                let _ = io::stdout().flush();
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+
+        Self {
+            label,
+            start,
+            done,
+            handle: Some(handle),
+            finished: false,
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.stop_thread();
+        let secs = self.start.elapsed().as_secs();
+        print!("\r(done {} {}s)\n", self.label, secs);
+        let _ = io::stdout().flush();
+        self.finished = true;
+    }
+
+    fn stop_thread(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for WorkingStatus {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stop_thread();
+            print!("\r");
+            let _ = io::stdout().flush();
+        }
+    }
 }

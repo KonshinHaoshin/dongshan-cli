@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod fs_tools;
 mod llm;
+mod updater;
 mod util;
 
 use anyhow::Result;
@@ -14,13 +15,16 @@ use crate::chat::run_chat;
 use crate::cli::{Cli, Commands};
 use crate::commands::{handle_config, handle_fs, handle_prompt, run_edit, run_onboard, run_review};
 use crate::config::load_config_or_default;
+use crate::updater::maybe_check_update;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let startup_cfg = load_config_or_default()?;
+    let _ = maybe_check_update(&startup_cfg).await;
 
     match cli.command {
-        Commands::Onboard => run_onboard()?,
+        Commands::Onboard => run_onboard().await?,
         Commands::Chat { session } => {
             let cfg = load_config_or_default()?;
             run_chat(cfg, &session).await?;

@@ -29,6 +29,10 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             api_key_env,
             api_key,
             allow_nsfw,
+            auto_check_update,
+            auto_exec_mode,
+            auto_exec_allow,
+            auto_exec_deny,
         } => {
             let mut cfg = load_config_or_default()?;
             if let Some(v) = base_url {
@@ -50,6 +54,18 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             if let Some(v) = allow_nsfw {
                 cfg.allow_nsfw = v;
             }
+            if let Some(v) = auto_check_update {
+                cfg.auto_check_update = v;
+            }
+            if let Some(v) = auto_exec_mode {
+                cfg.auto_exec_mode = v;
+            }
+            if let Some(v) = auto_exec_allow {
+                cfg.auto_exec_allow = parse_csv_list(&v);
+            }
+            if let Some(v) = auto_exec_deny {
+                cfg.auto_exec_deny = parse_csv_list(&v);
+            }
             save_config(&cfg)?;
             println!("Config updated:");
             println!("{}", toml::to_string_pretty(&cfg)?);
@@ -57,5 +73,13 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_csv_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect()
 }
 
