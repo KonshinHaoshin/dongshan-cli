@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use crate::prompt_store::{ensure_default_prompt, get_prompt_or_default};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ProviderPreset {
@@ -194,11 +195,8 @@ pub fn load_config_or_default() -> Result<Config> {
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     let mut cfg: Config =
         toml::from_str(&text).with_context(|| format!("Invalid config: {}", path.display()))?;
-    if !cfg.prompts.contains_key("default") {
-        cfg.prompts
-            .insert("default".to_string(), default_prompts()["default"].clone());
-    }
-    if cfg.active_prompt.is_empty() || !cfg.prompts.contains_key(&cfg.active_prompt) {
+    let _ = ensure_default_prompt();
+    if cfg.active_prompt.is_empty() {
         cfg.active_prompt = "default".to_string();
     }
     ensure_model_catalog(&mut cfg);
@@ -253,11 +251,8 @@ pub fn render_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> Strin
 }
 
 pub fn current_prompt_text(cfg: &Config) -> String {
-    let raw = cfg
-        .prompts
-        .get(&cfg.active_prompt)
-        .cloned()
-        .unwrap_or_else(|| default_prompts()["default"].clone());
+    let raw =
+        get_prompt_or_default(&cfg.active_prompt).unwrap_or_else(|_| default_prompts()["default"].clone());
     render_prompt_vars(&raw, &cfg.prompt_vars)
 }
 

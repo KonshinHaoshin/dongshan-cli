@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
 
 use crate::cli::PromptCommand;
-use crate::config::{current_prompt_text, default_prompts, load_config_or_default, save_config};
+use crate::config::{current_prompt_text, load_config_or_default, save_config};
+use crate::prompt_store::{list_prompt_names, remove_prompt, save_prompt};
 use crate::util::truncate_preview;
 
 pub fn handle_prompt(command: PromptCommand) -> Result<()> {
@@ -9,12 +10,22 @@ pub fn handle_prompt(command: PromptCommand) -> Result<()> {
     match command {
         PromptCommand::List => {
             println!("Active: {}", cfg.active_prompt);
-            for (name, text) in &cfg.prompts {
-                println!("- {}: {}", name, truncate_preview(text, 90));
+            for name in list_prompt_names()? {
+                let text = if name == cfg.active_prompt {
+                    current_prompt_text(&cfg)
+                } else {
+                    String::new()
+                };
+                let preview = if text.is_empty() {
+                    "(stored in prompts folder)".to_string()
+                } else {
+                    truncate_preview(&text, 90)
+                };
+                println!("- {}: {}", name, preview);
             }
         }
         PromptCommand::Save { name, text } => {
-            cfg.prompts.insert(name.clone(), text);
+            save_prompt(&name, &text)?;
             if cfg.active_prompt.is_empty() {
                 cfg.active_prompt = name;
             }
@@ -22,21 +33,15 @@ pub fn handle_prompt(command: PromptCommand) -> Result<()> {
             println!("Prompt saved.");
         }
         PromptCommand::Remove { name } => {
-            if cfg.prompts.remove(&name).is_none() {
-                bail!("Prompt not found: {name}");
-            }
+            remove_prompt(&name)?;
             if cfg.active_prompt == name {
                 cfg.active_prompt = "default".to_string();
-                if !cfg.prompts.contains_key("default") {
-                    cfg.prompts
-                        .insert("default".to_string(), default_prompts()["default"].clone());
-                }
             }
             save_config(&cfg)?;
             println!("Prompt removed.");
         }
         PromptCommand::Use { name } => {
-            if !cfg.prompts.contains_key(&name) {
+            if !list_prompt_names()?.iter().any(|p| p == &name) {
                 bail!("Prompt not found: {name}");
             }
             cfg.active_prompt = name;

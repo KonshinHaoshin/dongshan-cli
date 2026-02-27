@@ -18,11 +18,7 @@ pub fn ask(label: &str) -> Result<String> {
 }
 
 pub fn truncate_preview(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
-        text.to_string()
-    } else {
-        format!("{}...", &text[..max_len])
-    }
+    truncate_with_suffix(text, max_len, "...")
 }
 
 pub fn backup_path(file: &Path) -> PathBuf {
@@ -38,6 +34,38 @@ pub fn backup_path(file: &Path) -> PathBuf {
         format!("{stem}.bak.{ext}")
     };
     file.with_file_name(file_name)
+}
+
+pub fn truncate_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
+    let mut iter = text.char_indices();
+    let mut count = 0usize;
+    let mut cut_at = text.len();
+    while let Some((idx, _)) = iter.next() {
+        if count == max_chars {
+            cut_at = idx;
+            break;
+        }
+        count += 1;
+    }
+    if count < max_chars {
+        text.to_string()
+    } else {
+        format!("{}{}", &text[..cut_at], suffix)
+    }
+}
+
+pub fn prefix_chars(text: &str, max_chars: usize) -> String {
+    let mut iter = text.char_indices();
+    let mut count = 0usize;
+    let mut cut_at = text.len();
+    while let Some((idx, _)) = iter.next() {
+        if count == max_chars {
+            cut_at = idx;
+            break;
+        }
+        count += 1;
+    }
+    text[..cut_at].to_string()
 }
 
 pub struct WorkingStatus {

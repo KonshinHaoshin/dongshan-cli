@@ -10,6 +10,7 @@ use crate::config::{
     AutoExecMode, Config, ProviderPreset, apply_preset, config_path, ensure_model_catalog,
     load_config_or_default, provider_model_options, save_config,
 };
+use crate::prompt_store::{list_prompt_names, save_prompt};
 use crate::util::ask;
 
 pub async fn run_onboard() -> Result<()> {
@@ -88,19 +89,20 @@ pub async fn run_onboard() -> Result<()> {
     };
 
     println!("\nPrompt profile name to use (default):");
+    let prompt_names = list_prompt_names().unwrap_or_else(|_| vec!["default".to_string()]);
     println!(
         "Existing: {}",
-        cfg.prompts.keys().cloned().collect::<Vec<_>>().join(", ")
+        prompt_names.join(", ")
     );
     let active_name = ask(&format!("Active prompt name (default {}): ", cfg.active_prompt))?;
     if !active_name.trim().is_empty() {
         let name = active_name.trim().to_string();
-        if !cfg.prompts.contains_key(&name) {
+        if !prompt_names.iter().any(|p| p == &name) {
             let text = ask(&format!("Prompt '{}' text: ", name))?;
             if text.trim().is_empty() {
                 bail!("Prompt text cannot be empty for new prompt '{}'", name);
             }
-            cfg.prompts.insert(name.clone(), text);
+            save_prompt(&name, &text)?;
         }
         cfg.active_prompt = name;
     }
