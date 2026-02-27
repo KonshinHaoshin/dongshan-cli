@@ -31,6 +31,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: PromptCommand,
     },
+    /// Manage available models and active model
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
     /// Basic file system tools (read/list/grep)
     Fs {
         #[command(subcommand)]
@@ -93,6 +98,12 @@ pub enum ConfigCommand {
         /// Comma-separated denylist (highest priority), e.g. "rm,del,git reset"
         #[arg(long)]
         auto_exec_deny: Option<String>,
+        /// Ask before running non-trusted commands in chat
+        #[arg(long)]
+        auto_confirm_exec: Option<bool>,
+        /// Comma-separated trusted command prefixes, e.g. "rg,grep,git status"
+        #[arg(long)]
+        auto_exec_trusted: Option<String>,
     },
 }
 
@@ -131,5 +142,17 @@ pub enum FsCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelsCommand {
+    /// List saved model catalog and current active model
+    List,
+    /// Use one model as current active model
+    Use { name: String },
+    /// Add a model to local catalog
+    Add { name: String },
+    /// Remove a model from local catalog
+    Remove { name: String },
 }
 

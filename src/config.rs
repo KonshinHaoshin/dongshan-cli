@@ -47,6 +47,12 @@ pub struct Config {
     pub auto_exec_allow: Vec<String>,
     #[serde(default)]
     pub auto_exec_deny: Vec<String>,
+    #[serde(default = "default_auto_confirm_exec")]
+    pub auto_confirm_exec: bool,
+    #[serde(default)]
+    pub auto_exec_trusted: Vec<String>,
+    #[serde(default)]
+    pub model_catalog: Vec<String>,
 }
 
 impl Default for Config {
@@ -64,6 +70,9 @@ impl Default for Config {
             auto_exec_mode: AutoExecMode::Safe,
             auto_exec_allow: Vec::new(),
             auto_exec_deny: Vec::new(),
+            auto_confirm_exec: true,
+            auto_exec_trusted: vec!["rg".to_string(), "grep".to_string()],
+            model_catalog: vec!["gpt-4o-mini".to_string()],
         }
     }
 }
@@ -82,6 +91,10 @@ fn default_auto_check_update() -> bool {
 
 fn default_auto_exec_mode() -> AutoExecMode {
     AutoExecMode::Safe
+}
+
+fn default_auto_confirm_exec() -> bool {
+    true
 }
 
 pub fn default_prompts() -> BTreeMap<String, String> {
@@ -144,7 +157,14 @@ pub fn provider_model_options(provider: ProviderPreset) -> Vec<&'static str> {
             "anthropic/claude-3.5-sonnet",
             "meta-llama/llama-3.1-70b-instruct",
         ],
-        ProviderPreset::Xai => vec!["grok-2-latest", "grok-2-1212"],
+        ProviderPreset::Xai => vec![
+            "grok-4-latest",
+            "grok-4-1-fast-reasoning",
+            "grok-4-1-fast-non-reasoning",
+            "grok-code-fast-1",
+            "grok-2-latest",
+            "grok-2-1212",
+        ],
         ProviderPreset::Nvidia => vec![
             "meta/llama-3.1-70b-instruct",
             "mistralai/mixtral-8x7b-instruct-v0.1",
@@ -181,6 +201,7 @@ pub fn load_config_or_default() -> Result<Config> {
     if cfg.active_prompt.is_empty() || !cfg.prompts.contains_key(&cfg.active_prompt) {
         cfg.active_prompt = "default".to_string();
     }
+    ensure_model_catalog(&mut cfg);
     Ok(cfg)
 }
 
@@ -193,6 +214,16 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     let text = toml::to_string_pretty(cfg)?;
     fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+pub fn ensure_model_catalog(cfg: &mut Config) {
+    if cfg.model_catalog.is_empty() {
+        cfg.model_catalog.push(cfg.model.clone());
+        return;
+    }
+    if !cfg.model_catalog.iter().any(|m| m == &cfg.model) {
+        cfg.model_catalog.push(cfg.model.clone());
+    }
 }
 
 pub fn resolve_api_key(cfg: &Config) -> Result<String> {
@@ -238,6 +269,10 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are a careful code editor.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
+        prompt.push_str(
+            "\nWhen proposing executable terminal commands, use fenced ```bash``` or ```powershell``` blocks only.",
+        );
+        prompt.push_str("\nDo not use ```python``` blocks for shell commands.");
     }
     if cfg.allow_nsfw {
         prompt.push_str(

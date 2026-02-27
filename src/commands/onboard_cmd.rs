@@ -7,8 +7,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::config::{
-    AutoExecMode, Config, ProviderPreset, apply_preset, config_path, load_config_or_default,
-    provider_model_options, save_config,
+    AutoExecMode, Config, ProviderPreset, apply_preset, config_path, ensure_model_catalog,
+    load_config_or_default, provider_model_options, save_config,
 };
 use crate::util::ask;
 
@@ -66,6 +66,8 @@ pub async fn run_onboard() -> Result<()> {
     } else if choice_num <= model_options.len() {
         cfg.model = model_options[choice_num - 1].to_string();
     }
+    cfg.model_catalog = merge_unique(cfg.model_catalog, model_options.clone());
+    ensure_model_catalog(&mut cfg);
 
     let nsfw = ask("Allow NSFW in dongshan local prompt flow? [Y/n]: ")?;
     if matches!(nsfw.trim().to_lowercase().as_str(), "n" | "no" | "0" | "false") {

@@ -14,6 +14,8 @@
 - Chat with natural-language tool routing
 - Slash commands in chat (`/new`, `/read`, `/grep`, etc.)
 - Agent loop: auto-run commands based on your policy (`safe`/`all`/`custom`)
+- Only `bash/sh/powershell/pwsh/cmd` fenced blocks are considered for execution
+- Ask before running non-trusted commands, with "always trust this prefix" option
 - Auto update check from GitHub on startup
 - Real-time progress line in terminal (e.g. `(working model gpt-4o-mini 8s)`)
 
@@ -56,6 +58,8 @@ Slash commands:
 - `/list [path]`
 - `/grep <pattern> [path]`
 - `/prompt show|list|use <name>`
+- `/model list`
+- `/model use <name>`
 - `/clear`
 - `/exit`
 
@@ -66,11 +70,45 @@ Natural language examples:
 - `搜索 "run_chat" 在 src`
 - `查看当前配置`
 - `切换prompt reviewer`
+- `列出模型`
+- `切换模型 grok-code-fast-1`
 
 Session files:
 
 - `~/.dongshan/sessions/*.json`
 - Default `dongshan chat` session is isolated by current workspace path.
+
+## Prompt Profiles
+
+Create and switch multiple prompts:
+
+```powershell
+dongshan prompt list
+dongshan prompt save reviewer "You are a strict code reviewer. Focus on bugs and missing tests."
+dongshan prompt save architect "You are a software architect. Focus on modularity and long-term maintainability."
+dongshan prompt use reviewer
+dongshan prompt show
+```
+
+Set template variables:
+
+```powershell
+dongshan prompt var-set tone strict
+dongshan prompt var-list
+```
+
+Switch prompt inside chat:
+
+```text
+/prompt list
+/prompt use architect
+```
+
+Natural language in chat:
+
+```text
+切换prompt reviewer
+```
 
 ## Auto Exec Policy
 
@@ -79,6 +117,8 @@ You can choose how command blocks are executed in chat:
 - `safe` (default): built-in safe read-only commands
 - `all`: allow all commands (LLM decides what to run)
 - `custom`: only commands in your allowlist; denylist always blocks
+- `auto_confirm_exec=true`: ask before executing non-trusted commands
+- `auto_exec_trusted`: trusted command prefixes (e.g. `rg`, `grep`, `git status`)
 
 Examples:
 
@@ -91,6 +131,12 @@ dongshan config set --auto-exec-mode safe
 
 # 自定义：只允许 rg/ls/git status，且禁止 rm/del
 dongshan config set --auto-exec-mode custom --auto-exec-allow "rg,ls,git status" --auto-exec-deny "rm,del"
+
+# 开启逐条确认执行（默认 true）
+dongshan config set --auto-confirm-exec true
+
+# 设置默认信任前缀（这些命令不再询问）
+dongshan config set --auto-exec-trusted "rg,grep,git status"
 ```
 
 ## Auto Update Check
@@ -128,6 +174,8 @@ auto_check_update = true
 auto_exec_mode = "safe"
 auto_exec_allow = ["rg", "ls"]
 auto_exec_deny = ["rm", "del"]
+auto_confirm_exec = true
+auto_exec_trusted = ["rg", "grep", "git status"]
 
 [prompts]
 default = "You are a pragmatic senior software engineer."
@@ -136,5 +184,14 @@ edit = "Keep changes minimal and preserve behavior unless requested."
 
 [prompt_vars]
 tone = "strict"
+```
+
+## Models Command
+
+```powershell
+dongshan models list
+dongshan models add grok-code-fast-1
+dongshan models use grok-code-fast-1
+dongshan models remove old-model-name
 ```
 

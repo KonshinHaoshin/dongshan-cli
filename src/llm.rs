@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::config::{Config, resolve_api_key};
 use crate::util::WorkingStatus;
@@ -37,7 +38,10 @@ pub async fn call_llm_with_history(
         "temperature": 0.2
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(90))
+        .build()
+        .context("failed to build HTTP client")?;
     let resp = client
         .post(&cfg.base_url)
         .bearer_auth(api_key)

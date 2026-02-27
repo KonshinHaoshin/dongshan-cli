@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
-    AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text, save_config,
+    AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text, ensure_model_catalog,
+    save_config,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
@@ -50,13 +51,15 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
             continue;
         }
 
+        let ctx_working = WorkingStatus::start("collecting workspace context");
         let augmented_input = augment_user_input_with_workspace_context(&input)?;
+        ctx_working.finish();
         history.push(ChatMessage {
             role: "user".to_string(),
             content: augmented_input,
         });
 
-        run_agent_turn(&cfg, &mut history, "chat").await?;
+        run_agent_turn(&mut cfg, &mut history, "chat").await?;
         save_session(&active_session, &history)?;
     }
 
@@ -98,6 +101,31 @@ async fn handle_natural_language_tool_command(
         let out = toml::to_string_pretty(cfg)?;
         println!("{out}");
         push_tool_result(history, input, "config.show", &out);
+        return Ok(true);
+    }
+
+    if is_model_list_request(input, &lower) {
+        ensure_model_catalog(cfg);
+        println!("Current model: {}", cfg.model);
+        for m in &cfg.model_catalog {
+            let mark = if *m == cfg.model { "*" } else { " " };
+            println!("{mark} {m}");
+        }
+        push_tool_result(history, input, "model.list", &format!("current={}", cfg.model));
+        return Ok(true);
+    }
+
+    if let Some(name) = parse_model_use(input, &lower) {
+        ensure_model_catalog(cfg);
+        if !cfg.model_catalog.iter().any(|m| m == &name) {
+            println!("Model not found in catalog: {}", name);
+            return Ok(true);
+        }
+        cfg.model = name.clone();
+        save_config(cfg)?;
+        let out = format!("Active model switched to '{}'.", name);
+        println!("{out}");
+        push_tool_result(history, input, "model.use", &out);
         return Ok(true);
     }
 
@@ -222,6 +250,29 @@ fn is_config_show_request(input: &str, lower: &str) -> bool {
         || lower.contains("current config")
         || input.contains("\u{67e5}\u{770b}\u{914d}\u{7f6e}")
         || input.contains("\u{5f53}\u{524d}\u{914d}\u{7f6e}")
+}
+
+fn is_model_list_request(input: &str, lower: &str) -> bool {
+    lower.contains("list model")
+        || lower.contains("show models")
+        || input.contains("模型列表")
+        || input.contains("列出模型")
+}
+
+fn parse_model_use(input: &str, lower: &str) -> Option<String> {
+    if let Some(idx) = lower.find("use model ") {
+        let name = input[idx + "use model ".len()..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(idx) = input.find("切换模型") {
+        let name = input[idx + "切换模型".len()..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 fn parse_prompt_use(input: &str, lower: &str) -> Option<String> {
@@ -362,6 +413,8 @@ fn handle_chat_slash_command(
             println!("/prompt show");
             println!("/prompt list");
             println!("/prompt use <name>");
+            println!("/model list");
+            println!("/model use <name>");
         }
         "/new" => {
             let next = parts.next();
@@ -439,6 +492,36 @@ fn handle_chat_slash_command(
                 }
             }
         }
+        "/model" => {
+            ensure_model_catalog(cfg);
+            let Some(sub) = parts.next() else {
+                println!("Usage: /model <list|use>");
+                return Ok(());
+            };
+            match sub {
+                "list" => {
+                    println!("Current model: {}", cfg.model);
+                    for m in &cfg.model_catalog {
+                        let mark = if *m == cfg.model { "*" } else { " " };
+                        println!("{mark} {m}");
+                    }
+                }
+                "use" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /model use <name>");
+                        return Ok(());
+                    };
+                    if !cfg.model_catalog.iter().any(|m| m == name) {
+                        println!("Model not in catalog: {}", name);
+                        return Ok(());
+                    }
+                    cfg.model = name.to_string();
+                    save_config(cfg)?;
+                    println!("Active model switched to '{}'.", name);
+                }
+                _ => println!("Usage: /model <list|use>"),
+            }
+        }
         _ => {
             println!("Unknown command: {}. Use /help.", cmd);
         }
@@ -454,7 +537,7 @@ struct ExecResult {
     history_text: String,
 }
 
-fn maybe_execute_assistant_commands(cfg: &Config, answer: &str) -> Result<ExecResult> {
+fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<ExecResult> {
     let blocks = extract_command_blocks(answer);
     if blocks.is_empty() {
         return Ok(ExecResult {
@@ -486,6 +569,9 @@ fn maybe_execute_assistant_commands(cfg: &Config, answer: &str) -> Result<ExecRe
             {
                 continue;
             }
+            if !looks_like_shell_command_line(cmd) {
+                continue;
+            }
             if seen_commands >= MAX_COMMANDS_PER_RESPONSE {
                 let line = format!(
                     "Stopped auto exec after {} commands to avoid noisy output.\n",
@@ -509,6 +595,32 @@ fn maybe_execute_assistant_commands(cfg: &Config, answer: &str) -> Result<ExecRe
                 history.push_str(&line);
                 skipped_count += 1;
                 continue;
+            }
+            if cfg.auto_confirm_exec && !is_trusted_command(cfg, cmd) {
+                let prefix = command_prefix(cmd);
+                let input = ask(&format!(
+                    "Run command `{}` ? [y]es/[n]o/[a]lways `{}`/[q]stop: ",
+                    cmd, prefix
+                ))?;
+                let choice = input.trim().to_ascii_lowercase();
+                if choice == "q" {
+                    let line = "User stopped command execution.\n".to_string();
+                    display.push_str(&line);
+                    history.push_str(&line);
+                    break;
+                }
+                if choice == "a" {
+                    if !cfg.auto_exec_trusted.iter().any(|x| x.eq_ignore_ascii_case(&prefix)) {
+                        cfg.auto_exec_trusted.push(prefix.clone());
+                        let _ = save_config(cfg);
+                    }
+                } else if choice != "y" {
+                    let line = format!("Skipped by user: {}\n", cmd);
+                    display.push_str(&line);
+                    history.push_str(&line);
+                    skipped_count += 1;
+                    continue;
+                }
             }
             let out = run_shell_command(cmd)?;
             display.push_str(&format!("$ {}\n{}\n", cmd, out));
@@ -578,20 +690,56 @@ fn looks_like_command_failure(output: &str) -> bool {
         || s.contains("is not recognized")
 }
 
-async fn run_agent_turn(cfg: &Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
+fn looks_like_shell_command_line(cmd: &str) -> bool {
+    let c = cmd.trim();
+    if c.is_empty() {
+        return false;
+    }
+
+    let lower = c.to_ascii_lowercase();
+    if lower.starts_with("import ")
+        || lower.starts_with("from ")
+        || lower.starts_with("def ")
+        || lower.starts_with("class ")
+        || lower.starts_with("return ")
+        || lower.starts_with("try:")
+        || lower.starts_with("except")
+        || lower.starts_with("finally:")
+        || lower.starts_with("if ")
+        || lower.starts_with("for ")
+        || lower.starts_with("while ")
+        || lower.starts_with("let ")
+        || lower.starts_with("const ")
+        || lower.starts_with("$code")
+        || lower == "@'"
+        || lower == "'@"
+    {
+        return false;
+    }
+
+    if lower.contains(" = @'") || lower.contains(" = '@") {
+        return false;
+    }
+
+    true
+}
+
+async fn run_agent_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
     let system = build_system_prompt(cfg, mode);
     run_agent_turn_with_system(cfg, history, &system).await
 }
 
 async fn run_agent_turn_with_system(
-    cfg: &Config,
+    cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     system: &str,
 ) -> Result<()> {
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
     loop {
+        println!("(phase: model reasoning step {})", steps + 1);
         let answer = call_llm_with_history(cfg, system, history).await?;
+        println!("assistant> {}\n", answer);
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
         history.push(ChatMessage {
             role: "assistant".to_string(),
@@ -599,11 +747,11 @@ async fn run_agent_turn_with_system(
         });
 
         if !exec_result.had_blocks {
-            println!("assistant> {}\n", answer);
             return Ok(());
         }
 
         if exec_result.executed_any {
+            println!("(phase: executing suggested commands)");
             println!("assistant> {}", exec_result.display_text);
             history.push(ChatMessage {
                 role: "user".to_string(),
@@ -693,6 +841,21 @@ fn matches_list(list: &[String], cmd: &str) -> bool {
         let s = item.trim().to_ascii_lowercase();
         !s.is_empty() && cmd_l.starts_with(&s)
     })
+}
+
+fn is_trusted_command(cfg: &Config, cmd: &str) -> bool {
+    matches_list(&cfg.auto_exec_trusted, cmd)
+}
+
+fn command_prefix(cmd: &str) -> String {
+    let mut it = cmd.split_whitespace();
+    let first = it.next().unwrap_or("").to_string();
+    if first.eq_ignore_ascii_case("git")
+        && let Some(second) = it.next()
+    {
+        return format!("git {}", second);
+    }
+    first
 }
 
 fn is_safe_auto_exec_command(cmd: &str) -> bool {

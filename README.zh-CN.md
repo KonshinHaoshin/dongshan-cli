@@ -12,6 +12,8 @@
 - `chat` 自然语言工具路由
 - `/new`、`/read`、`/grep` 等斜杠命令
 - Agent 循环：根据策略自动执行命令块并回喂模型
+- 仅对 `bash/sh/powershell/pwsh/cmd` 代码块做命令执行解析
+- 对“非默认信任命令”执行前询问，可一键设为默认信任前缀
 - 启动自动检查更新（GitHub）
 
 ## 构建
@@ -46,6 +48,8 @@ dongshan chat
 - `/list [path]`
 - `/grep <pattern> [path]`
 - `/prompt show|list|use <name>`
+- `/model list`
+- `/model use <name>`
 - `/clear`
 - `/exit`
 
@@ -56,11 +60,45 @@ dongshan chat
 - `搜索 "run_chat" 在 src`
 - `查看当前配置`
 - `切换prompt reviewer`
+- `列出模型`
+- `切换模型 grok-code-fast-1`
 
 会话文件：
 
 - `~/.dongshan/sessions/*.json`
 - 默认 `dongshan chat` 会按当前路径隔离记忆。
+
+## Prompt 多模板编写与切换
+
+可创建多个 prompt 并随时切换：
+
+```powershell
+dongshan prompt list
+dongshan prompt save reviewer "你是严格代码审查员，优先找 bug 和缺失测试。"
+dongshan prompt save architect "你是架构顾问，优先关注模块边界和长期可维护性。"
+dongshan prompt use reviewer
+dongshan prompt show
+```
+
+设置 Prompt 变量模板：
+
+```powershell
+dongshan prompt var-set tone strict
+dongshan prompt var-list
+```
+
+在 chat 内切换：
+
+```text
+/prompt list
+/prompt use architect
+```
+
+也支持自然语言：
+
+```text
+切换prompt reviewer
+```
 
 ## 命令自动执行策略
 
@@ -69,6 +107,8 @@ dongshan chat
 - `safe`：默认内置安全白名单
 - `all`：全部放行（由 LLM 自行选择要执行的命令，谨慎）
 - `custom`：只允许你配置的 allow 列表；deny 永远优先拦截
+- `auto_confirm_exec=true`：对非信任命令执行前询问
+- `auto_exec_trusted`：默认信任命令前缀（如 `rg`、`grep`、`git status`）
 
 示例：
 
@@ -81,6 +121,12 @@ dongshan config set --auto-exec-mode safe
 
 # 自定义策略
 dongshan config set --auto-exec-mode custom --auto-exec-allow "rg,ls,git status" --auto-exec-deny "rm,del"
+
+# 开启逐条确认执行（默认 true）
+dongshan config set --auto-confirm-exec true
+
+# 配置默认信任前缀
+dongshan config set --auto-exec-trusted "rg,grep,git status"
 ```
 
 ## 自动更新检查
@@ -116,4 +162,15 @@ auto_check_update = true
 auto_exec_mode = "safe"
 auto_exec_allow = ["rg", "ls"]
 auto_exec_deny = ["rm", "del"]
+auto_confirm_exec = true
+auto_exec_trusted = ["rg", "grep", "git status"]
+```
+
+## 模型命令
+
+```powershell
+dongshan models list
+dongshan models add grok-code-fast-1
+dongshan models use grok-code-fast-1
+dongshan models remove old-model-name
 ```
