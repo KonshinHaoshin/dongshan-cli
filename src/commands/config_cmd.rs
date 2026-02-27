@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::cli::ConfigCommand;
 use crate::config::{
     Config, apply_preset, config_path, ensure_model_catalog, load_config_or_default, save_config,
+    set_active_model, update_active_model_profile,
 };
 
 pub fn handle_config(command: ConfigCommand) -> Result<()> {
@@ -39,11 +40,11 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             auto_exec_trusted,
         } => {
             let mut cfg = load_config_or_default()?;
+            if let Some(v) = model {
+                set_active_model(&mut cfg, &v);
+            }
             if let Some(v) = base_url {
                 cfg.base_url = v;
-            }
-            if let Some(v) = model {
-                cfg.model = v;
             }
             if let Some(v) = api_key_env {
                 cfg.api_key_env = v;
@@ -55,6 +56,7 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
                     cfg.api_key = Some(v);
                 }
             }
+            update_active_model_profile(&mut cfg);
             if let Some(v) = allow_nsfw {
                 cfg.allow_nsfw = v;
             }

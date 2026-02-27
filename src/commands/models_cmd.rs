@@ -1,7 +1,10 @@
 use anyhow::{Result, bail};
 
 use crate::cli::ModelsCommand;
-use crate::config::{ensure_model_catalog, load_config_or_default, save_config};
+use crate::config::{
+    add_model_with_active_profile, ensure_model_catalog, load_config_or_default, remove_model,
+    save_config, set_active_model,
+};
 
 pub fn handle_models(command: ModelsCommand) -> Result<()> {
     let mut cfg = load_config_or_default()?;
@@ -20,14 +23,12 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
             if !cfg.model_catalog.iter().any(|m| m == &name) {
                 bail!("Model not in catalog: {}. Use `dongshan models add {}` first.", name, name);
             }
-            cfg.model = name.clone();
+            set_active_model(&mut cfg, &name);
             save_config(&cfg)?;
             println!("Active model switched to {}", name);
         }
         ModelsCommand::Add { name } => {
-            if !cfg.model_catalog.iter().any(|m| m == &name) {
-                cfg.model_catalog.push(name.clone());
-            }
+            add_model_with_active_profile(&mut cfg, &name);
             save_config(&cfg)?;
             println!("Model added: {}", name);
         }
@@ -35,9 +36,7 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
             if name == cfg.model {
                 bail!("Cannot remove active model: {}", name);
             }
-            let before = cfg.model_catalog.len();
-            cfg.model_catalog.retain(|m| m != &name);
-            if cfg.model_catalog.len() == before {
+            if !remove_model(&mut cfg, &name) {
                 bail!("Model not found in catalog: {}", name);
             }
             save_config(&cfg)?;

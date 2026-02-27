@@ -66,8 +66,13 @@ http://127.0.0.1:3721
 
 - Provider/API 配置（`base_url`、`api_key_env`、`api_key`、`allow_nsfw`）
 - 模型目录（新增/切换/删除）
+- 按模型独立配置连接信息：每个模型各自维护 `base_url` / `api_key_env` / `api_key`
 - Prompt 文件（保存/切换/删除）
 - 自动执行策略（`safe/all/custom`、allow/deny/trusted、确认开关）
+
+说明：
+
+- `onboard` 现在只保存你最终选择的模型，不会把候选列表全部加入模型目录。
 
 ## Chat
 

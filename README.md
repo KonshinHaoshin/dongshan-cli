@@ -76,10 +76,12 @@ You can manage:
 
 - Provider/API fields (`base_url`, `api_key_env`, `api_key`, `allow_nsfw`)
 - Model catalog (add/use/remove)
+- Per-model connection profile: each model has its own `base_url` / `api_key_env` / `api_key`
 - Prompt files (save/use/delete)
 - Auto exec policy (`safe/all/custom`, allow/deny/trusted, confirm flag)
 - Frontend is split into static files: `web/index.html`, `web/app.css`, `web/app.js`
 - UI uses Vue component architecture (loaded from CDN in `index.html`)
+- `onboard` only saves the model you selected (it no longer bulk-adds all suggested models)
 
 ## Chat
 

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
     AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text, ensure_model_catalog,
-    save_config,
+    save_config, set_active_model,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
@@ -127,7 +127,7 @@ async fn handle_natural_language_tool_command(
             println!("Model not found in catalog: {}", name);
             return Ok(true);
         }
-        cfg.model = name.clone();
+        set_active_model(cfg, &name);
         save_config(cfg)?;
         let out = format!("Active model switched to '{}'.", name);
         println!("{out}");
@@ -521,7 +521,7 @@ fn handle_chat_slash_command(
                         println!("Model not in catalog: {}", name);
                         return Ok(());
                     }
-                    cfg.model = name.to_string();
+                    set_active_model(cfg, name);
                     save_config(cfg)?;
                     println!("Active model switched to '{}'.", name);
                 }

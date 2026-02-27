@@ -8,7 +8,10 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AutoExecMode, ensure_model_catalog, load_config_or_default, save_config};
+use crate::config::{
+    AutoExecMode, add_model_with_active_profile, ensure_model_catalog, load_config_or_default,
+    remove_model, save_config, set_active_model, update_active_model_profile,
+};
 use crate::prompt_store::{list_prompts, remove_prompt, save_prompt};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -90,11 +93,11 @@ async fn api_state() -> ApiResult<Json<StateResponse>> {
 
 async fn api_set_config(Json(req): Json<ConfigUpdateRequest>) -> ApiResult<Json<SimpleOk>> {
     let mut cfg = load_config_or_default().map_err(api_err)?;
+    if let Some(v) = req.model {
+        set_active_model(&mut cfg, &v);
+    }
     if let Some(v) = req.base_url {
         cfg.base_url = v;
-    }
-    if let Some(v) = req.model {
-        cfg.model = v;
     }
     if let Some(v) = req.api_key_env {
         cfg.api_key_env = v;
@@ -105,6 +108,7 @@ async fn api_set_config(Json(req): Json<ConfigUpdateRequest>) -> ApiResult<Json<
     if let Some(v) = req.allow_nsfw {
         cfg.allow_nsfw = v;
     }
+    update_active_model_profile(&mut cfg);
     ensure_model_catalog(&mut cfg);
     save_config(&cfg).map_err(api_err)?;
     Ok(Json(SimpleOk { ok: true }))
@@ -134,19 +138,14 @@ async fn api_prompt_delete(Json(req): Json<PromptDeleteRequest>) -> ApiResult<Js
 
 async fn api_model_add(Json(req): Json<ModelAddRequest>) -> ApiResult<Json<SimpleOk>> {
     let mut cfg = load_config_or_default().map_err(api_err)?;
-    if !cfg.model_catalog.iter().any(|m| m == &req.name) {
-        cfg.model_catalog.push(req.name);
-    }
+    add_model_with_active_profile(&mut cfg, &req.name);
     save_config(&cfg).map_err(api_err)?;
     Ok(Json(SimpleOk { ok: true }))
 }
 
 async fn api_model_use(Json(req): Json<ModelUseRequest>) -> ApiResult<Json<SimpleOk>> {
     let mut cfg = load_config_or_default().map_err(api_err)?;
-    if !cfg.model_catalog.iter().any(|m| m == &req.name) {
-        cfg.model_catalog.push(req.name.clone());
-    }
-    cfg.model = req.name;
+    set_active_model(&mut cfg, &req.name);
     save_config(&cfg).map_err(api_err)?;
     Ok(Json(SimpleOk { ok: true }))
 }
@@ -156,7 +155,7 @@ async fn api_model_remove(Json(req): Json<ModelRemoveRequest>) -> ApiResult<Json
     if cfg.model == req.name {
         return Err((StatusCode::BAD_REQUEST, "Cannot remove active model".to_string()));
     }
-    cfg.model_catalog.retain(|m| m != &req.name);
+    remove_model(&mut cfg, &req.name);
     save_config(&cfg).map_err(api_err)?;
     Ok(Json(SimpleOk { ok: true }))
 }
