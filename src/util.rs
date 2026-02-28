@@ -17,6 +17,17 @@ pub fn ask(label: &str) -> Result<String> {
     Ok(input.trim_end_matches(['\n', '\r']).to_string())
 }
 
+pub fn blue_label(text: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return text.to_string();
+    }
+    format!("\x1b[94m{}\x1b[0m", text)
+}
+
+pub fn tagged_prompt(tag: &str, label: &str) -> String {
+    format!("{} {}", blue_label(&format!("[{}]", tag)), label)
+}
+
 pub fn truncate_preview(text: &str, max_len: usize) -> String {
     truncate_with_suffix(text, max_len, "...")
 }

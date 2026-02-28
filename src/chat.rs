@@ -1,10 +1,11 @@
-use std::fs;
+﻿use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
@@ -15,9 +16,11 @@ use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
     try_rg_files, try_rg_grep,
 };
-use crate::llm::{ChatMessage, call_llm_with_history};
+use crate::llm::{ChatMessage, call_llm_with_history_stream};
 use crate::prompt_store::list_prompt_names;
-use crate::util::{WorkingStatus, ask, prefix_chars, truncate_preview, truncate_with_suffix};
+use crate::util::{
+    WorkingStatus, ask, prefix_chars, tagged_prompt, truncate_preview, truncate_with_suffix,
+};
 const MAX_AUTO_TOOL_STEPS: usize = 3;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
@@ -42,7 +45,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut cfg,
                 &mut history,
                 &mut active_session,
-            )?;
+            ).await?;
             save_session(&active_session, &history)?;
             continue;
         }
@@ -60,6 +63,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
             content: augmented_input,
         });
 
+        maybe_compact_history(&mut history, &cfg);
         run_agent_turn(&mut cfg, &mut history, "chat").await?;
         save_session(&active_session, &history)?;
     }
@@ -137,34 +141,20 @@ async fn handle_natural_language_tool_command(
 
     if let Some(path) = extract_existing_file_path(input) {
         if !is_read_request(input, &lower) && !is_list_request(input, &lower) && !is_grep_request(input, &lower) {
-            let content = read_text_file(Path::new(&path))?;
-            let ext = Path::new(&path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("txt");
-            let prompt = format!(
-                "User asked to analyze or improve this file.\n\
-                 Provide concrete improvements: correctness, maintainability, tests, and readability.\n\
-                 Do not output shell commands; provide direct analysis.\n\n\
-                 Original user request:\n{}\n\n\
-                 File: {}\n```{}\n{}\n```",
-                input, path, ext, content
-            );
-            history.push(ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-            });
-            let system = build_system_prompt(cfg, "review");
-            run_agent_turn_with_system(cfg, history, &system).await?;
+            submit_file_to_model(cfg, history, input, &path).await?;
             return Ok(true);
         }
     }
 
     if is_read_request(input, &lower) {
         if let Some(path) = extract_path(input) {
-            let content = read_text_file(Path::new(&path))?;
-            println!("{content}");
-            push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+            if has_followup_analysis_intent(input, &lower) {
+                submit_file_to_model(cfg, history, input, &path).await?;
+            } else {
+                let content = read_text_file(Path::new(&path))?;
+                println!("{content}");
+                push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+            }
             return Ok(true);
         }
     }
@@ -195,6 +185,45 @@ async fn handle_natural_language_tool_command(
     Ok(false)
 }
 
+async fn submit_file_to_model(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    user_request: &str,
+    path: &str,
+) -> Result<()> {
+    let content = read_text_file(Path::new(path))?;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt");
+    let prompt = format!(
+        "User asked to analyze this file and answer a concrete request.\n\
+         Provide direct answer to user request first, then list supporting evidence from file.\n\
+         Do not output shell commands unless user explicitly asks.\n\n\
+         Original user request:\n{}\n\n\
+         File: {}\n```{}\n{}\n```",
+        user_request, path, ext, content
+    );
+    history.push(ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    });
+    maybe_compact_history(history, cfg);
+    let system = build_system_prompt(cfg, "review");
+    run_agent_turn_with_system(cfg, history, &system).await
+}
+
+fn has_followup_analysis_intent(input: &str, lower: &str) -> bool {
+    lower.contains("then")
+        || lower.contains("and tell")
+        || lower.contains("and analyze")
+        || input.contains("然后")
+        || input.contains("并")
+        || input.contains("后续")
+        || input.contains("告诉我")
+        || input.contains("分析")
+        || input.contains("觉得")
+}
 fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str, output: &str) {
     history.push(ChatMessage {
         role: "user".to_string(),
@@ -208,6 +237,47 @@ fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str
 
 fn clip_output(text: &str, max_len: usize) -> String {
     truncate_with_suffix(text, max_len, "...\n[truncated]")
+}
+
+fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
+    let max_messages = cfg.history_max_messages.max(4);
+    let max_chars = cfg.history_max_chars.max(2000);
+    let total_chars = history.iter().map(|m| m.content.chars().count()).sum::<usize>();
+    if history.len() <= max_messages && total_chars <= max_chars {
+        return;
+    }
+    if history.len() < 8 {
+        return;
+    }
+
+    let tail_keep = (max_messages / 2).max(6).min(history.len().saturating_sub(1));
+    let split_at = history.len().saturating_sub(tail_keep);
+    if split_at == 0 {
+        return;
+    }
+
+    let older = &history[..split_at];
+    let summary = summarize_history(older);
+    let mut compacted = Vec::with_capacity(tail_keep + 1);
+    compacted.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: format!("[session-summary]\n{}", summary),
+    });
+    compacted.extend_from_slice(&history[split_at..]);
+    *history = compacted;
+}
+
+fn summarize_history(messages: &[ChatMessage]) -> String {
+    let mut lines = Vec::new();
+    for m in messages.iter().rev().take(20).rev() {
+        let role = if m.role == "user" { "user" } else { "assistant" };
+        let short = truncate_with_suffix(m.content.trim(), 220, "...");
+        lines.push(format!("- {}: {}", role, short.replace('\n', " ")));
+    }
+    let mut out = String::new();
+    out.push_str("Compressed earlier context:\n");
+    out.push_str(&lines.join("\n"));
+    truncate_with_suffix(&out, 4000, "...\n[summary truncated]")
 }
 
 fn is_read_request(input: &str, lower: &str) -> bool {
@@ -233,16 +303,14 @@ fn is_list_request(input: &str, lower: &str) -> bool {
 
 fn is_grep_request(input: &str, lower: &str) -> bool {
     lower.contains("grep ")
-        || lower.contains("search ")
-        || lower.contains("find ")
+        || lower.contains("search ") || lower.contains("search for ") || lower.contains("find ") || lower.contains("find in ")
         || input.contains("\u{641c}\u{7d22}")
         || input.contains("\u{67e5}\u{627e}")
         || input.contains("\u{68c0}\u{7d22}")
 }
 
 fn is_prompt_list_request(input: &str, lower: &str) -> bool {
-    lower.contains("list prompt")
-        || lower.contains("show prompts")
+    lower.contains("list prompt") || lower.contains("show prompts") || lower.contains("list presets") || lower.contains("show preset prompts")
         || input.contains("\u{63d0}\u{793a}\u{8bcd}\u{5217}\u{8868}")
         || input.contains("\u{5217}\u{51fa}prompt")
 }
@@ -257,8 +325,8 @@ fn is_config_show_request(input: &str, lower: &str) -> bool {
 fn is_model_list_request(input: &str, lower: &str) -> bool {
     lower.contains("list model")
         || lower.contains("show models")
-        || input.contains("模型列表")
-        || input.contains("列出模型")
+        || input.contains("妯″瀷鍒楄〃")
+        || input.contains("鍒楀嚭妯″瀷")
 }
 
 fn parse_model_use(input: &str, lower: &str) -> Option<String> {
@@ -268,8 +336,8 @@ fn parse_model_use(input: &str, lower: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    if let Some(idx) = input.find("切换模型") {
-        let name = input[idx + "切换模型".len()..].trim();
+    if let Some(idx) = input.find("鍒囨崲妯″瀷") {
+        let name = input[idx + "鍒囨崲妯″瀷".len()..].trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
@@ -280,6 +348,12 @@ fn parse_model_use(input: &str, lower: &str) -> Option<String> {
 fn parse_prompt_use(input: &str, lower: &str) -> Option<String> {
     if let Some(idx) = lower.find("use prompt ") {
         let name = input[idx + "use prompt ".len()..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(idx) = lower.find("load prompt ") {
+        let name = input[idx + "load prompt ".len()..].trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
@@ -300,7 +374,13 @@ fn extract_search_pattern(input: &str) -> Option<String> {
     if let Some(p) = extract_after_keyword(input, "grep ") {
         return Some(first_token(p));
     }
+    if let Some(p) = extract_after_keyword(input, "search for ") {
+        return Some(first_token(p));
+    }
     if let Some(p) = extract_after_keyword(input, "search ") {
+        return Some(first_token(p));
+    }
+    if let Some(p) = extract_after_keyword(input, "find in ") {
         return Some(first_token(p));
     }
     if let Some(p) = extract_after_keyword(input, "find ") {
@@ -391,7 +471,7 @@ fn first_token(s: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
 }
 
-fn handle_chat_slash_command(
+async fn handle_chat_slash_command(
     input: &str,
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
@@ -410,6 +490,7 @@ fn handle_chat_slash_command(
             println!("/new [name]");
             println!("/clear");
             println!("/read <file>");
+            println!("/askfile <file> <question>");
             println!("/list [path]");
             println!("/grep <pattern> [path]");
             println!("/prompt show");
@@ -441,6 +522,18 @@ fn handle_chat_slash_command(
             };
             let content = read_text_file(Path::new(file))?;
             println!("{content}");
+        }
+        "/askfile" => {
+            let Some(file) = parts.next() else {
+                println!("Usage: /askfile <file> <question>");
+                return Ok(());
+            };
+            let question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                println!("Usage: /askfile <file> <question>");
+                return Ok(());
+            }
+            submit_file_to_model(cfg, history, &question, file).await?;
         }
         "/list" => {
             let path = parts.next().unwrap_or(".");
@@ -543,9 +636,25 @@ struct ExecResult {
     history_text: String,
 }
 
+#[derive(Debug, Clone)]
+struct ToolCall {
+    tool: String,
+    command: String,
+}
+
 fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<ExecResult> {
-    let blocks = extract_command_blocks(answer);
-    if blocks.is_empty() {
+    let calls = extract_tool_calls(answer);
+    if calls.is_empty() {
+        if contains_legacy_shell_block(answer) {
+            let msg = "Detected legacy shell block. Skipped: use JSON tool_calls instead.\n";
+            return Ok(ExecResult {
+                executed_any: false,
+                had_blocks: true,
+                skipped_any: true,
+                display_text: format!("\n{}", msg),
+                history_text: format!("tool[shell.auto_exec] output:\n{}", msg),
+            });
+        }
         return Ok(ExecResult {
             executed_any: false,
             had_blocks: false,
@@ -561,88 +670,81 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
     let mut skipped_count = 0usize;
     let mut seen_commands = 0usize;
     let mut failed_commands = 0usize;
-    for block in blocks {
-        for raw in block.lines() {
-            let cmd = raw.trim();
-            if cmd.is_empty() {
-                continue;
-            }
-            if cmd.starts_with('#')
-                || cmd.starts_with("//")
-                || cmd.starts_with('-')
-                || cmd.starts_with('*')
-                || cmd.starts_with("```")
-            {
-                continue;
-            }
-            if !looks_like_shell_command_line(cmd) {
-                continue;
-            }
-            if seen_commands >= MAX_COMMANDS_PER_RESPONSE {
-                let line = format!(
-                    "Stopped auto exec after {} commands to avoid noisy output.\n",
-                    MAX_COMMANDS_PER_RESPONSE
-                );
+    for call in calls {
+        if call.tool.to_ascii_lowercase() != "shell" {
+            continue;
+        }
+        let cmd = call.command.trim();
+        if cmd.is_empty() {
+            continue;
+        }
+        if seen_commands >= MAX_COMMANDS_PER_RESPONSE {
+            let line = format!(
+                "Stopped auto exec after {} commands to avoid noisy output.\n",
+                MAX_COMMANDS_PER_RESPONSE
+            );
+            display.push_str(&line);
+            history.push_str(&line);
+            break;
+        }
+        seen_commands += 1;
+        if let Some(reason) = precheck_command(cmd) {
+            let line = format!("Skipped command: {} ({})\n", cmd, reason);
+            display.push_str(&line);
+            history.push_str(&line);
+            skipped_count += 1;
+            continue;
+        }
+        if !is_command_allowed(cfg, cmd) {
+            let line = format!("Skipped unsafe command: {}\n", cmd);
+            display.push_str(&line);
+            history.push_str(&line);
+            skipped_count += 1;
+            continue;
+        }
+        if cfg.auto_confirm_exec && !is_trusted_command(cfg, cmd) {
+            let prefix = command_prefix(cmd);
+            let input = ask(&tagged_prompt(
+                "exec-confirm",
+                &format!(
+                    "Run command `{}` ? [y=yes]/[n=no]/[a=always `{}`]/[q=stop]: ",
+                    cmd, prefix
+                ),
+            ))?;
+            let choice = input.trim().to_ascii_lowercase();
+            if choice == "q" {
+                let line = "User stopped command execution.\n".to_string();
                 display.push_str(&line);
                 history.push_str(&line);
                 break;
             }
-            seen_commands += 1;
-            if let Some(reason) = precheck_command(cmd) {
-                let line = format!("Skipped command: {} ({})\n", cmd, reason);
+            if choice == "a" {
+                if !cfg.auto_exec_trusted.iter().any(|x| x.eq_ignore_ascii_case(&prefix)) {
+                    cfg.auto_exec_trusted.push(prefix.clone());
+                    let _ = save_config(cfg);
+                }
+            } else if choice != "y" {
+                let line = format!("Skipped by user: {}\n", cmd);
                 display.push_str(&line);
                 history.push_str(&line);
                 skipped_count += 1;
                 continue;
             }
-            if !is_command_allowed(cfg, cmd) {
-                let line = format!("Skipped unsafe command: {}\n", cmd);
+        }
+        let out = run_shell_command(cmd)?;
+        display.push_str(&format!("$ {}\n{}\n", cmd, out));
+        history.push_str(&format!("Executed: {}\nOutput:\n{}\n", cmd, out));
+        executed_count += 1;
+        if looks_like_command_failure(&out) {
+            failed_commands += 1;
+            if failed_commands >= MAX_FAILED_COMMANDS_PER_RESPONSE {
+                let line = format!(
+                    "Stopped auto exec after {} failed commands.\n",
+                    MAX_FAILED_COMMANDS_PER_RESPONSE
+                );
                 display.push_str(&line);
                 history.push_str(&line);
-                skipped_count += 1;
-                continue;
-            }
-            if cfg.auto_confirm_exec && !is_trusted_command(cfg, cmd) {
-                let prefix = command_prefix(cmd);
-                let input = ask(&format!(
-                    "Run command `{}` ? [y]es/[n]o/[a]lways `{}`/[q]stop: ",
-                    cmd, prefix
-                ))?;
-                let choice = input.trim().to_ascii_lowercase();
-                if choice == "q" {
-                    let line = "User stopped command execution.\n".to_string();
-                    display.push_str(&line);
-                    history.push_str(&line);
-                    break;
-                }
-                if choice == "a" {
-                    if !cfg.auto_exec_trusted.iter().any(|x| x.eq_ignore_ascii_case(&prefix)) {
-                        cfg.auto_exec_trusted.push(prefix.clone());
-                        let _ = save_config(cfg);
-                    }
-                } else if choice != "y" {
-                    let line = format!("Skipped by user: {}\n", cmd);
-                    display.push_str(&line);
-                    history.push_str(&line);
-                    skipped_count += 1;
-                    continue;
-                }
-            }
-            let out = run_shell_command(cmd)?;
-            display.push_str(&format!("$ {}\n{}\n", cmd, out));
-            history.push_str(&format!("Executed: {}\nOutput:\n{}\n", cmd, out));
-            executed_count += 1;
-            if looks_like_command_failure(&out) {
-                failed_commands += 1;
-                if failed_commands >= MAX_FAILED_COMMANDS_PER_RESPONSE {
-                    let line = format!(
-                        "Stopped auto exec after {} failed commands.\n",
-                        MAX_FAILED_COMMANDS_PER_RESPONSE
-                    );
-                    display.push_str(&line);
-                    history.push_str(&line);
-                    break;
-                }
+                break;
             }
         }
     }
@@ -696,40 +798,6 @@ fn looks_like_command_failure(output: &str) -> bool {
         || s.contains("is not recognized")
 }
 
-fn looks_like_shell_command_line(cmd: &str) -> bool {
-    let c = cmd.trim();
-    if c.is_empty() {
-        return false;
-    }
-
-    let lower = c.to_ascii_lowercase();
-    if lower.starts_with("import ")
-        || lower.starts_with("from ")
-        || lower.starts_with("def ")
-        || lower.starts_with("class ")
-        || lower.starts_with("return ")
-        || lower.starts_with("try:")
-        || lower.starts_with("except")
-        || lower.starts_with("finally:")
-        || lower.starts_with("if ")
-        || lower.starts_with("for ")
-        || lower.starts_with("while ")
-        || lower.starts_with("let ")
-        || lower.starts_with("const ")
-        || lower.starts_with("$code")
-        || lower == "@'"
-        || lower == "'@"
-    {
-        return false;
-    }
-
-    if lower.contains(" = @'") || lower.contains(" = '@") {
-        return false;
-    }
-
-    true
-}
-
 async fn run_agent_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
     let system = build_system_prompt(cfg, mode);
     run_agent_turn_with_system(cfg, history, &system).await
@@ -743,9 +811,22 @@ async fn run_agent_turn_with_system(
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
     loop {
+        maybe_compact_history(history, cfg);
         println!("(phase: model reasoning step {})", steps + 1);
-        let answer = call_llm_with_history(cfg, system, history).await?;
-        println!("assistant> {}\n", answer);
+        print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+        let answer = match call_llm_with_history_stream(cfg, system, history).await {
+            Ok(v) => v,
+            Err(err) => {
+                println!("\n");
+                println!(
+                    "assistant> Request interrupted: {}",
+                    truncate_with_suffix(&err.to_string(), 220, " ...")
+                );
+                println!("assistant> You can continue chatting and send the next message.\n");
+                return Ok(());
+            }
+        };
+        println!("\n");
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
         history.push(ChatMessage {
             role: "assistant".to_string(),
@@ -762,7 +843,7 @@ async fn run_agent_turn_with_system(
             history.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
-                    "{}\nContinue based on command outputs above. If complete, give final answer without command blocks.",
+                    "{}\nContinue based on tool outputs above. If more execution is needed, emit JSON tool_calls. If complete, give final answer directly.",
                     exec_result.history_text
                 ),
             });
@@ -781,53 +862,86 @@ async fn run_agent_turn_with_system(
             unsafe_retries += 1;
             history.push(ChatMessage {
                 role: "user".to_string(),
-                content: "Your last response contained unsafe or unsupported shell commands in this environment. Do not output command blocks. Give a direct final analysis/result in plain text based on available context.".to_string(),
+                content: "Your last response used unsupported execution format or unsafe commands. Use JSON tool_calls only, and only when needed. Otherwise provide direct final analysis/result.".to_string(),
             });
             continue;
         }
 
-        println!("assistant> Detected command block(s), but skipped because commands are unsafe.\n");
+        println!("assistant> Detected tool calls, but skipped because commands are unsafe or unsupported.\n");
         return Ok(());
     }
 }
 
-fn extract_command_blocks(text: &str) -> Vec<String> {
-    let tags = ["```bash", "```sh", "```powershell", "```pwsh", "```cmd"];
+fn contains_legacy_shell_block(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("```bash")
+        || t.contains("```sh")
+        || t.contains("```powershell")
+        || t.contains("```pwsh")
+        || t.contains("```cmd")
+}
+
+fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < text.len() {
         let slice = &text[i..];
-        let mut found: Option<(usize, &str)> = None;
-        for tag in &tags {
-            if let Some(pos) = slice.find(tag) {
-                match found {
-                    Some((best, _)) if pos >= best => {}
-                    _ => found = Some((pos, tag)),
-                }
-            }
-        }
-        let Some((pos, tag)) = found else {
+        let Some(pos) = slice.find("```json") else {
             break;
         };
-        let start = i + pos + tag.len();
+        let start = i + pos + "```json".len();
         let after_tag = &text[start..];
         let line_skip = if let Some(nl) = after_tag.find('\n') {
             nl + 1
         } else {
             break;
         };
-        let cmd_start = start + line_skip;
-        let rest = &text[cmd_start..];
+        let json_start = start + line_skip;
+        let rest = &text[json_start..];
         let Some(end_rel) = rest.find("```") else {
             break;
         };
-        let cmd = rest[..end_rel].trim().to_string();
-        if !cmd.is_empty() {
-            out.push(cmd);
+        let block = rest[..end_rel].trim();
+        if !block.is_empty()
+            && let Ok(value) = serde_json::from_str::<Value>(block)
+        {
+            collect_tool_calls_from_value(&value, &mut out);
         }
-        i = cmd_start + end_rel + 3;
+        i = json_start + end_rel + 3;
     }
     out
+}
+
+fn collect_tool_calls_from_value(value: &Value, out: &mut Vec<ToolCall>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_calls_from_value(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(calls) = map.get("tool_calls") {
+                collect_tool_calls_from_value(calls, out);
+                return;
+            }
+            let tool = map
+                .get("tool")
+                .or_else(|| map.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let command = map
+                .get("command")
+                .or_else(|| map.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !tool.trim().is_empty() && !command.trim().is_empty() {
+                out.push(ToolCall { tool, command });
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_command_allowed(cfg: &Config, cmd: &str) -> bool {
@@ -902,8 +1016,12 @@ fn run_shell_command(cmd: &str) -> Result<String> {
     }
 
     let output = if cfg!(target_os = "windows") {
+        let wrapped = format!(
+            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}",
+            cmd
+        );
         Command::new("powershell")
-            .args(["-NoProfile", "-Command", cmd])
+            .args(["-NoProfile", "-Command", &wrapped])
             .output()
             .with_context(|| format!("Failed to run command: {cmd}"))?
     } else {
@@ -1086,4 +1204,10 @@ fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
     fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
+
+
+
+
+
+
 

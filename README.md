@@ -19,6 +19,10 @@
 - Ask before running non-trusted commands, with "always trust this prefix" option
 - Auto update check from GitHub on startup
 - Real-time progress line in terminal (e.g. `(working model gpt-4o-mini 8s)`)
+- Per-model profile (`base_url` / `api_key_env` / `api_key`) for custom OpenAI-compatible endpoints
+- `dongshan doctor` health check for current model profile
+- Structured JSON tool-call execution (no legacy shell block auto-exec)
+- Automatic chat history compaction (message and character budget)
 
 ## Build
 
@@ -39,6 +43,45 @@ If command is not found, add Cargo bin to PATH:
 $cargoBin = "$HOME\\.cargo\\bin"
 [Environment]::SetEnvironmentVariable("Path", $env:Path + ";" + $cargoBin, "User")
 ```
+
+## Windows Setup EXE
+
+For normal users, use the installer from GitHub Releases:
+
+- `dongshan-setup-windows-x86_64.exe` (recommended)
+- `dongshan-windows-x86_64.zip` (portable)
+
+After installation, open a new PowerShell and run:
+
+```powershell
+dongshan --help
+```
+
+Uninstall behavior:
+
+- Start Menu shortcuts are removed by uninstaller
+- Installer-added `{app}` PATH entry is automatically cleaned on uninstall
+
+## Release Packaging
+
+This repo includes automated packaging for Windows setup:
+
+- Workflow: `.github/workflows/release.yml`
+- Inno script: `packaging/windows/dongshan.iss`
+- Local build script: `scripts/build-installer.ps1`
+
+Publish a new release by pushing a tag:
+
+```powershell
+git tag v0.1.3
+git push origin v0.1.3
+```
+
+GitHub Actions will build and upload:
+
+- `dongshan-setup-windows-x86_64.exe`
+- `dongshan-windows-x86_64.zip`
+- `SHA256SUMS.txt`
 
 ## Quick Start
 
@@ -81,7 +124,6 @@ You can manage:
 - Auto exec policy (`safe/all/custom`, allow/deny/trusted, confirm flag)
 - Frontend is split into static files: `web/index.html`, `web/app.css`, `web/app.js`
 - UI uses Vue component architecture (loaded from CDN in `index.html`)
-- `onboard` only saves the model you selected (it no longer bulk-adds all suggested models)
 
 ## Chat
 
@@ -97,6 +139,7 @@ Slash commands:
 - `/model use <name>`
 - `/clear`
 - `/exit`
+
 
 Natural language examples:
 
@@ -190,11 +233,7 @@ dongshan config set --auto-exec-trusted "rg,grep,git status"
 
 - Source repo: `https://github.com/KonshinHaoshin/dongshan-cli`
 - Checks about every 24 hours by default.
-- On newer version, it prints:
-
-```powershell
-cargo install --git https://github.com/KonshinHaoshin/dongshan-cli --force
-```
+- On newer version, it prints release page and asset hints.
 
 Disable:
 
@@ -240,5 +279,132 @@ dongshan models list
 dongshan models add grok-code-fast-1
 dongshan models use grok-code-fast-1
 dongshan models remove old-model-name
+dongshan models show
+dongshan models show grok-code-fast-1
+dongshan models set-profile grok-code-fast-1 --base-url "https://api.x.ai/v1/chat/completions" --api-key-env "XAI_API_KEY"
 ```
 
+Custom model with custom endpoint/key:
+
+```powershell
+dongshan models add my-openai-compatible \
+  --base-url "https://your-gateway.example.com/v1/chat/completions" \
+  --api-key-env "MY_GATEWAY_KEY"
+dongshan models use my-openai-compatible
+```
+
+## Doctor
+
+```powershell
+dongshan doctor
+```
+
+Checks:
+
+- Current model profile exists
+- `base_url` validity
+- API key resolution
+- `/models` endpoint reachability (warning-only if unsupported)
+- Real chat completion request health
+
+## Chat Execution Protocol
+
+- Auto execution only parses JSON tool-call blocks:
+
+```json
+{"tool_calls":[{"tool":"shell","command":"rg --files"}]}
+```
+
+- Legacy `bash/powershell` blocks are ignored for auto execution.
+
+## Session Compaction
+
+Tune chat memory budget:
+
+```powershell
+dongshan config set --history-max-messages 24 --history-max-chars 50000
+```
+
+## Core commands in `dongshan chat`
+
+### `/read <file>`
+- Reads and prints file content directly.
+- Does not ask the model to analyze.
+
+Examples:
+```text
+/read README.md
+/read src/chat.rs
+```
+
+### `/list [path]`
+- Lists files under a directory.
+- Prefers `rg --files`, falls back to recursive listing.
+
+Examples:
+```text
+/list
+/list src
+```
+
+### `/grep <pattern> [path]`
+- Searches text in files under a path.
+- Prefers `rg`, falls back to built-in recursive grep.
+
+Examples:
+```text
+/grep WorkingStatus src
+/grep "read_text_file" src
+```
+
+### `/askfile <file> <question>`
+- Reads file content and sends it to the model.
+- Use this when you want "read + explain/analyze".
+
+Examples:
+```text
+/askfile src/llm.rs Why does stream timeout happen?
+/askfile src/chat.rs Summarize command confirmation flow.
+```
+
+## 3) Natural-language equivalents
+
+You can use natural language instead of slash commands.
+
+Read file:
+- `read src/chat.rs`
+- `open file README.md`
+- `cat README.md`
+
+List files:
+- `list files src`
+- `show files`
+- `ls src`
+
+Search:
+- `grep timeout src`
+- `search for timeout in src`
+- `find stream in src`
+
+## 4) Which one to use
+
+- Raw content quickly: `/read`
+- File overview: `/list`
+- Locate symbols/strings: `/grep`
+- Read then explain: `/askfile`
+
+## 5) Practical notes
+
+- Quote paths if they contain spaces.
+- `/read` only prints; it does not summarize.
+- Use `/askfile` (or ask follow-up) for analysis.
+- If `Request interrupted` appears, continue chatting directly; no restart needed.
+
+## 6) Quick templates
+
+```text
+/list src
+/grep "Failed to read stream chunk" src
+/read src/llm.rs
+/askfile src/llm.rs Explain timeout path and propose fixes.
+```

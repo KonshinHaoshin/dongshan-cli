@@ -1,4 +1,5 @@
 mod config_cmd;
+mod doctor_cmd;
 mod edit_cmd;
 mod fs_cmd;
 mod models_cmd;
@@ -7,6 +8,7 @@ mod prompt_cmd;
 mod review_cmd;
 
 pub use config_cmd::handle_config;
+pub use doctor_cmd::run_doctor;
 pub use edit_cmd::run_edit;
 pub use fs_cmd::handle_fs;
 pub use models_cmd::handle_models;
