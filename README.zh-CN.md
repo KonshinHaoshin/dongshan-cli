@@ -63,8 +63,8 @@ dongshan --help
 发布新版本（打 tag）：
 
 ```powershell
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 GitHub Actions 会自动上传：

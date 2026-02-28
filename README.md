@@ -73,8 +73,8 @@ This repo includes automated packaging for Windows setup:
 Publish a new release by pushing a tag:
 
 ```powershell
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 GitHub Actions will build and upload:
