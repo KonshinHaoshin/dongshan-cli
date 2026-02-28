@@ -152,8 +152,8 @@ async fn handle_natural_language_tool_command(
                 submit_file_to_model(cfg, history, input, &path).await?;
             } else {
                 let content = read_text_file(Path::new(&path))?;
-                println!("{content}");
                 push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+                println!("Read {} (content hidden). Ask a follow-up question to analyze it.", path);
             }
             return Ok(true);
         }
@@ -489,7 +489,7 @@ async fn handle_chat_slash_command(
             println!("/exit");
             println!("/new [name]");
             println!("/clear");
-            println!("/read <file>");
+            println!("/read <file> [question]");
             println!("/askfile <file> <question>");
             println!("/list [path]");
             println!("/grep <pattern> [path]");
@@ -520,8 +520,14 @@ async fn handle_chat_slash_command(
                 println!("Usage: /read <file>");
                 return Ok(());
             };
-            let content = read_text_file(Path::new(file))?;
-            println!("{content}");
+            let question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                let content = read_text_file(Path::new(file))?;
+                push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+                println!("Read {} (content hidden). Ask a follow-up question to analyze it.", file);
+            } else {
+                submit_file_to_model(cfg, history, &question, file).await?;
+            }
         }
         "/askfile" => {
             let Some(file) = parts.next() else {

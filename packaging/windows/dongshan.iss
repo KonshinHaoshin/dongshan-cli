@@ -20,7 +20,7 @@ WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
 DisableProgramGroupPage=yes
-LicenseFile=LICENSE
+LicenseFile=..\..\LICENSE
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
