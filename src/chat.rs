@@ -1022,9 +1022,10 @@ fn run_shell_command(cmd: &str) -> Result<String> {
     }
 
     let output = if cfg!(target_os = "windows") {
+        let normalized = normalize_windows_shell_command(cmd);
         let wrapped = format!(
             "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}",
-            cmd
+            normalized
         );
         Command::new("powershell")
             .args(["-NoProfile", "-Command", &wrapped])
@@ -1056,6 +1057,32 @@ fn run_shell_command(cmd: &str) -> Result<String> {
     Ok(out)
 }
 
+fn normalize_windows_shell_command(cmd: &str) -> String {
+    // Windows PowerShell 5.1 does not support "&&"; convert to sequential separator.
+    // This keeps common model-generated commands like `cd path && ls -la` runnable.
+    let mut out = String::with_capacity(cmd.len());
+    let mut chars = cmd.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(ch);
+            }
+            '&' if !in_single && !in_double && chars.peek() == Some(&'&') => {
+                let _ = chars.next();
+                out.push_str("; ");
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
 fn run_translated_safe_command(cmd: &str) -> Result<Option<String>> {
     if !cfg!(target_os = "windows") {
         return Ok(None);

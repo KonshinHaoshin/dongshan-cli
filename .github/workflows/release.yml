@@ -38,10 +38,11 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
+          $exe = (Resolve-Path "target\release\dongshan.exe").Path
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
             "packaging\windows\dongshan.iss" `
             "/DMyAppVersion=$version" `
-            "/DMyAppExe=target\release\dongshan.exe" `
+            "/DMyAppExe=$exe" `
             "/Odist" `
             "/Fdongshan-setup-windows-x86_64"
 
