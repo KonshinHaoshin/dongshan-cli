@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
@@ -16,7 +16,7 @@ use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
     try_rg_files, try_rg_grep,
 };
-use crate::llm::{ChatMessage, call_llm_with_history};
+use crate::llm::{ChatMessage, call_llm_with_history_stream};
 use crate::prompt_store::list_prompt_names;
 use crate::util::{WorkingStatus, ask, prefix_chars, truncate_preview, truncate_with_suffix};
 const MAX_AUTO_TOOL_STEPS: usize = 3;
@@ -43,7 +43,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut cfg,
                 &mut history,
                 &mut active_session,
-            )?;
+            ).await?;
             save_session(&active_session, &history)?;
             continue;
         }
@@ -139,35 +139,20 @@ async fn handle_natural_language_tool_command(
 
     if let Some(path) = extract_existing_file_path(input) {
         if !is_read_request(input, &lower) && !is_list_request(input, &lower) && !is_grep_request(input, &lower) {
-            let content = read_text_file(Path::new(&path))?;
-            let ext = Path::new(&path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("txt");
-            let prompt = format!(
-                "User asked to analyze or improve this file.\n\
-                 Provide concrete improvements: correctness, maintainability, tests, and readability.\n\
-                 Do not output shell commands; provide direct analysis.\n\n\
-                 Original user request:\n{}\n\n\
-                 File: {}\n```{}\n{}\n```",
-                input, path, ext, content
-            );
-            history.push(ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-            });
-            maybe_compact_history(history, cfg);
-            let system = build_system_prompt(cfg, "review");
-            run_agent_turn_with_system(cfg, history, &system).await?;
+            submit_file_to_model(cfg, history, input, &path).await?;
             return Ok(true);
         }
     }
 
     if is_read_request(input, &lower) {
         if let Some(path) = extract_path(input) {
-            let content = read_text_file(Path::new(&path))?;
-            println!("{content}");
-            push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+            if has_followup_analysis_intent(input, &lower) {
+                submit_file_to_model(cfg, history, input, &path).await?;
+            } else {
+                let content = read_text_file(Path::new(&path))?;
+                println!("{content}");
+                push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
+            }
             return Ok(true);
         }
     }
@@ -198,6 +183,45 @@ async fn handle_natural_language_tool_command(
     Ok(false)
 }
 
+async fn submit_file_to_model(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    user_request: &str,
+    path: &str,
+) -> Result<()> {
+    let content = read_text_file(Path::new(path))?;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt");
+    let prompt = format!(
+        "User asked to analyze this file and answer a concrete request.\n\
+         Provide direct answer to user request first, then list supporting evidence from file.\n\
+         Do not output shell commands unless user explicitly asks.\n\n\
+         Original user request:\n{}\n\n\
+         File: {}\n```{}\n{}\n```",
+        user_request, path, ext, content
+    );
+    history.push(ChatMessage {
+        role: "user".to_string(),
+        content: prompt,
+    });
+    maybe_compact_history(history, cfg);
+    let system = build_system_prompt(cfg, "review");
+    run_agent_turn_with_system(cfg, history, &system).await
+}
+
+fn has_followup_analysis_intent(input: &str, lower: &str) -> bool {
+    lower.contains("then")
+        || lower.contains("and tell")
+        || lower.contains("and analyze")
+        || input.contains("然后")
+        || input.contains("并")
+        || input.contains("后续")
+        || input.contains("告诉我")
+        || input.contains("分析")
+        || input.contains("觉得")
+}
 fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str, output: &str) {
     history.push(ChatMessage {
         role: "user".to_string(),
@@ -277,16 +301,14 @@ fn is_list_request(input: &str, lower: &str) -> bool {
 
 fn is_grep_request(input: &str, lower: &str) -> bool {
     lower.contains("grep ")
-        || lower.contains("search ")
-        || lower.contains("find ")
+        || lower.contains("search ") || lower.contains("search for ") || lower.contains("find ") || lower.contains("find in ")
         || input.contains("\u{641c}\u{7d22}")
         || input.contains("\u{67e5}\u{627e}")
         || input.contains("\u{68c0}\u{7d22}")
 }
 
 fn is_prompt_list_request(input: &str, lower: &str) -> bool {
-    lower.contains("list prompt")
-        || lower.contains("show prompts")
+    lower.contains("list prompt") || lower.contains("show prompts") || lower.contains("list presets") || lower.contains("show preset prompts")
         || input.contains("\u{63d0}\u{793a}\u{8bcd}\u{5217}\u{8868}")
         || input.contains("\u{5217}\u{51fa}prompt")
 }
@@ -301,8 +323,8 @@ fn is_config_show_request(input: &str, lower: &str) -> bool {
 fn is_model_list_request(input: &str, lower: &str) -> bool {
     lower.contains("list model")
         || lower.contains("show models")
-        || input.contains("模型列表")
-        || input.contains("列出模型")
+        || input.contains("妯″瀷鍒楄〃")
+        || input.contains("鍒楀嚭妯″瀷")
 }
 
 fn parse_model_use(input: &str, lower: &str) -> Option<String> {
@@ -312,8 +334,8 @@ fn parse_model_use(input: &str, lower: &str) -> Option<String> {
             return Some(name.to_string());
         }
     }
-    if let Some(idx) = input.find("切换模型") {
-        let name = input[idx + "切换模型".len()..].trim();
+    if let Some(idx) = input.find("鍒囨崲妯″瀷") {
+        let name = input[idx + "鍒囨崲妯″瀷".len()..].trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
@@ -324,6 +346,12 @@ fn parse_model_use(input: &str, lower: &str) -> Option<String> {
 fn parse_prompt_use(input: &str, lower: &str) -> Option<String> {
     if let Some(idx) = lower.find("use prompt ") {
         let name = input[idx + "use prompt ".len()..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(idx) = lower.find("load prompt ") {
+        let name = input[idx + "load prompt ".len()..].trim();
         if !name.is_empty() {
             return Some(name.to_string());
         }
@@ -344,7 +372,13 @@ fn extract_search_pattern(input: &str) -> Option<String> {
     if let Some(p) = extract_after_keyword(input, "grep ") {
         return Some(first_token(p));
     }
+    if let Some(p) = extract_after_keyword(input, "search for ") {
+        return Some(first_token(p));
+    }
     if let Some(p) = extract_after_keyword(input, "search ") {
+        return Some(first_token(p));
+    }
+    if let Some(p) = extract_after_keyword(input, "find in ") {
         return Some(first_token(p));
     }
     if let Some(p) = extract_after_keyword(input, "find ") {
@@ -435,7 +469,7 @@ fn first_token(s: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
 }
 
-fn handle_chat_slash_command(
+async fn handle_chat_slash_command(
     input: &str,
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
@@ -454,6 +488,7 @@ fn handle_chat_slash_command(
             println!("/new [name]");
             println!("/clear");
             println!("/read <file>");
+            println!("/askfile <file> <question>");
             println!("/list [path]");
             println!("/grep <pattern> [path]");
             println!("/prompt show");
@@ -485,6 +520,18 @@ fn handle_chat_slash_command(
             };
             let content = read_text_file(Path::new(file))?;
             println!("{content}");
+        }
+        "/askfile" => {
+            let Some(file) = parts.next() else {
+                println!("Usage: /askfile <file> <question>");
+                return Ok(());
+            };
+            let question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                println!("Usage: /askfile <file> <question>");
+                return Ok(());
+            }
+            submit_file_to_model(cfg, history, &question, file).await?;
         }
         "/list" => {
             let path = parts.next().unwrap_or(".");
@@ -761,8 +808,9 @@ async fn run_agent_turn_with_system(
     loop {
         maybe_compact_history(history, cfg);
         println!("(phase: model reasoning step {})", steps + 1);
-        let answer = call_llm_with_history(cfg, system, history).await?;
-        println!("assistant> {}\n", answer);
+        print!("assistant> ");
+        let answer = call_llm_with_history_stream(cfg, system, history).await?;
+        println!("\n");
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
         history.push(ChatMessage {
             role: "assistant".to_string(),
@@ -1136,4 +1184,10 @@ fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
     fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
+
+
+
+
+
+
 

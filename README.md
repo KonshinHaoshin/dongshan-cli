@@ -57,6 +57,11 @@ After installation, open a new PowerShell and run:
 dongshan --help
 ```
 
+Uninstall behavior:
+
+- Start Menu shortcuts are removed by uninstaller
+- Installer-added `{app}` PATH entry is automatically cleaned on uninstall
+
 ## Release Packaging
 
 This repo includes automated packaging for Windows setup:
@@ -119,7 +124,6 @@ You can manage:
 - Auto exec policy (`safe/all/custom`, allow/deny/trusted, confirm flag)
 - Frontend is split into static files: `web/index.html`, `web/app.css`, `web/app.js`
 - UI uses Vue component architecture (loaded from CDN in `index.html`)
-- `onboard` only saves the model you selected (it no longer bulk-adds all suggested models)
 
 ## Chat
 
