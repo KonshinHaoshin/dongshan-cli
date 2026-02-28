@@ -12,7 +12,7 @@ use crate::config::{
     update_active_model_profile,
 };
 use crate::prompt_store::{list_prompt_names, save_prompt};
-use crate::util::ask;
+use crate::util::{ask, tagged_prompt};
 
 pub async fn run_onboard() -> Result<()> {
     let mut cfg = load_config_or_default()?;
@@ -26,7 +26,10 @@ pub async fn run_onboard() -> Result<()> {
     println!("3) openrouter");
     println!("4) xai");
     println!("5) nvidia");
-    let provider_input = ask("Provider [1-5] (default 1): ")?;
+    let provider_input = ask(&tagged_prompt(
+        "onboard",
+        "Provider [1=openai/2=deepseek/3=openrouter/4=xai/5=nvidia] (default 1): ",
+    ))?;
     let preset = match provider_input.trim() {
         "2" | "deepseek" => ProviderPreset::Deepseek,
         "3" | "openrouter" => ProviderPreset::Openrouter,
@@ -36,7 +39,10 @@ pub async fn run_onboard() -> Result<()> {
     };
     apply_preset(&mut cfg, preset);
 
-    let key = ask("API key (leave empty to keep existing): ")?;
+    let key = ask(&tagged_prompt(
+        "onboard",
+        "API key (leave empty to keep existing): ",
+    ))?;
     if !key.trim().is_empty() {
         cfg.api_key = Some(key.trim().to_string());
     }
@@ -58,10 +64,16 @@ pub async fn run_onboard() -> Result<()> {
         println!("{}) {}", idx + 1, m);
     }
     println!("0) custom input");
-    let model_choice = ask(&format!("Model option [0-{}] (default 1): ", model_options.len()))?;
+    let model_choice = ask(&tagged_prompt(
+        "onboard",
+        &format!("Model option [0=custom..{}] (default 1): ", model_options.len()),
+    ))?;
     let choice_num = model_choice.trim().parse::<usize>().unwrap_or(1);
     let selected_model = if choice_num == 0 {
-        let model = ask(&format!("Model (default {}): ", cfg.model))?;
+        let model = ask(&tagged_prompt(
+            "onboard",
+            &format!("Model (default {}): ", cfg.model),
+        ))?;
         if !model.trim().is_empty() {
             model.trim().to_string()
         } else {
@@ -76,7 +88,10 @@ pub async fn run_onboard() -> Result<()> {
     add_model_with_active_profile(&mut cfg, &selected_model);
     update_active_model_profile(&mut cfg);
 
-    let nsfw = ask("Allow NSFW in dongshan local prompt flow? [Y/n]: ")?;
+    let nsfw = ask(&tagged_prompt(
+        "confirm",
+        "Allow NSFW in dongshan local prompt flow? [y=allow]/[n=disallow] (default y): ",
+    ))?;
     if matches!(nsfw.trim().to_lowercase().as_str(), "n" | "no" | "0" | "false") {
         cfg.allow_nsfw = false;
     } else if !nsfw.trim().is_empty() {
@@ -87,7 +102,10 @@ pub async fn run_onboard() -> Result<()> {
     println!("1) safe   (recommended)");
     println!("2) all    (LLM decides, execute all commands)");
     println!("3) custom (you configure allow/deny later)");
-    let exec_mode = ask("Policy [1-3] (default 1): ")?;
+    let exec_mode = ask(&tagged_prompt(
+        "confirm",
+        "Policy [1=safe]/[2=all]/[3=custom] (default 1): ",
+    ))?;
     cfg.auto_exec_mode = match exec_mode.trim() {
         "2" | "all" => AutoExecMode::All,
         "3" | "custom" => AutoExecMode::Custom,
@@ -100,11 +118,14 @@ pub async fn run_onboard() -> Result<()> {
         "Existing: {}",
         prompt_names.join(", ")
     );
-    let active_name = ask(&format!("Active prompt name (default {}): ", cfg.active_prompt))?;
+    let active_name = ask(&tagged_prompt(
+        "onboard",
+        &format!("Active prompt name (default {}): ", cfg.active_prompt),
+    ))?;
     if !active_name.trim().is_empty() {
         let name = active_name.trim().to_string();
         if !prompt_names.iter().any(|p| p == &name) {
-            let text = ask(&format!("Prompt '{}' text: ", name))?;
+            let text = ask(&tagged_prompt("onboard", &format!("Prompt '{}' text: ", name)))?;
             if text.trim().is_empty() {
                 bail!("Prompt text cannot be empty for new prompt '{}'", name);
             }

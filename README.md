@@ -140,6 +140,7 @@ Slash commands:
 - `/clear`
 - `/exit`
 
+
 Natural language examples:
 
 - `帮我读取 src/main.rs`
@@ -324,3 +325,86 @@ Tune chat memory budget:
 dongshan config set --history-max-messages 24 --history-max-chars 50000
 ```
 
+## Core commands in `dongshan chat`
+
+### `/read <file>`
+- Reads and prints file content directly.
+- Does not ask the model to analyze.
+
+Examples:
+```text
+/read README.md
+/read src/chat.rs
+```
+
+### `/list [path]`
+- Lists files under a directory.
+- Prefers `rg --files`, falls back to recursive listing.
+
+Examples:
+```text
+/list
+/list src
+```
+
+### `/grep <pattern> [path]`
+- Searches text in files under a path.
+- Prefers `rg`, falls back to built-in recursive grep.
+
+Examples:
+```text
+/grep WorkingStatus src
+/grep "read_text_file" src
+```
+
+### `/askfile <file> <question>`
+- Reads file content and sends it to the model.
+- Use this when you want "read + explain/analyze".
+
+Examples:
+```text
+/askfile src/llm.rs Why does stream timeout happen?
+/askfile src/chat.rs Summarize command confirmation flow.
+```
+
+## 3) Natural-language equivalents
+
+You can use natural language instead of slash commands.
+
+Read file:
+- `read src/chat.rs`
+- `open file README.md`
+- `cat README.md`
+
+List files:
+- `list files src`
+- `show files`
+- `ls src`
+
+Search:
+- `grep timeout src`
+- `search for timeout in src`
+- `find stream in src`
+
+## 4) Which one to use
+
+- Raw content quickly: `/read`
+- File overview: `/list`
+- Locate symbols/strings: `/grep`
+- Read then explain: `/askfile`
+
+## 5) Practical notes
+
+- Quote paths if they contain spaces.
+- `/read` only prints; it does not summarize.
+- Use `/askfile` (or ask follow-up) for analysis.
+- If `Request interrupted` appears, continue chatting directly; no restart needed.
+
+## 6) Quick templates
+
+```text
+/list src
+/grep "Failed to read stream chunk" src
+/read src/llm.rs
+/askfile src/llm.rs Explain timeout path and propose fixes.
+```

@@ -131,6 +131,8 @@ http://127.0.0.1:3721
 - `/clear`
 - `/exit`
 
+
+
 自然语言示例：
 
 - `帮我读取 src/main.rs`
@@ -301,4 +303,86 @@ dongshan doctor
 
 ```powershell
 dongshan config set --history-max-messages 24 --history-max-chars 50000
+```
+## `dongshan chat` 里的核心指令
+### `/read <file>`
+- 直接读取并打印文件内容。
+- 不会让模型分析。
+
+示例：
+```text
+/read README.md
+/read src/chat.rs
+```
+
+### `/list [path]`
+- 列出目录下文件。
+- 优先使用 `rg --files`，不可用时回退递归列举。
+
+示例：
+```text
+/list
+/list src
+```
+
+### `/grep <pattern> [path]`
+- 在路径下搜索文本。
+- 优先使用 `rg`，不可用时回退内置递归搜索。
+
+示例：
+```text
+/grep WorkingStatus src
+/grep "read_text_file" src
+```
+
+### `/askfile <file> <question>`
+- 读取文件后把内容交给模型回答问题。
+- 适合“读完并解释/分析”场景。
+
+示例：
+```text
+/askfile src/llm.rs 这里为什么会超时？
+/askfile src/chat.rs 总结命令确认流程
+```
+
+## 3) 自然语言等价写法
+
+不用斜杠命令也能触发。
+
+读文件：
+- `读取 src/chat.rs`
+- `打开文件 README.md`
+- `cat README.md`
+
+列文件：
+- `列出文件 src`
+- `看看目录结构`
+- `ls src`
+
+搜索：
+- `搜索 timeout 在 src`
+- `查找 stream 在 src`
+- `grep timeout src`
+
+## 4) 何时用哪个
+
+- 快速看原文：`/read`
+- 看目录结构：`/list`
+- 定位关键字：`/grep`
+- 读完并解释：`/askfile`
+
+## 5) 使用注意事项
+
+- 路径有空格时请加引号。
+- `/read` 只打印，不会自动总结。
+- 要分析请用 `/askfile` 或继续追问。
+- 出现 `Request interrupted` 不用退出 chat，直接发下一条即可。
+
+## 6) 快速模板
+
+```text
+/list src
+/grep "Failed to read stream chunk" src
+/read src/llm.rs
+/askfile src/llm.rs 解释超时路径并给出修改建议
 ```

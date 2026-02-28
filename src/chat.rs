@@ -18,7 +18,9 @@ use crate::fs_tools::{
 };
 use crate::llm::{ChatMessage, call_llm_with_history_stream};
 use crate::prompt_store::list_prompt_names;
-use crate::util::{WorkingStatus, ask, prefix_chars, truncate_preview, truncate_with_suffix};
+use crate::util::{
+    WorkingStatus, ask, prefix_chars, tagged_prompt, truncate_preview, truncate_with_suffix,
+};
 const MAX_AUTO_TOOL_STEPS: usize = 3;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
@@ -702,9 +704,12 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
         }
         if cfg.auto_confirm_exec && !is_trusted_command(cfg, cmd) {
             let prefix = command_prefix(cmd);
-            let input = ask(&format!(
-                "Run command `{}` ? [y]es/[n]o/[a]lways `{}`/[q]stop: ",
-                cmd, prefix
+            let input = ask(&tagged_prompt(
+                "exec-confirm",
+                &format!(
+                    "Run command `{}` ? [y=yes]/[n=no]/[a=always `{}`]/[q=stop]: ",
+                    cmd, prefix
+                ),
             ))?;
             let choice = input.trim().to_ascii_lowercase();
             if choice == "q" {
@@ -808,8 +813,19 @@ async fn run_agent_turn_with_system(
     loop {
         maybe_compact_history(history, cfg);
         println!("(phase: model reasoning step {})", steps + 1);
-        print!("assistant> ");
-        let answer = call_llm_with_history_stream(cfg, system, history).await?;
+        print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+        let answer = match call_llm_with_history_stream(cfg, system, history).await {
+            Ok(v) => v,
+            Err(err) => {
+                println!("\n");
+                println!(
+                    "assistant> Request interrupted: {}",
+                    truncate_with_suffix(&err.to_string(), 220, " ...")
+                );
+                println!("assistant> You can continue chatting and send the next message.\n");
+                return Ok(());
+            }
+        };
         println!("\n");
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
         history.push(ChatMessage {
@@ -1000,8 +1016,12 @@ fn run_shell_command(cmd: &str) -> Result<String> {
     }
 
     let output = if cfg!(target_os = "windows") {
+        let wrapped = format!(
+            "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); {}",
+            cmd
+        );
         Command::new("powershell")
-            .args(["-NoProfile", "-Command", cmd])
+            .args(["-NoProfile", "-Command", &wrapped])
             .output()
             .with_context(|| format!("Failed to run command: {cmd}"))?
     } else {

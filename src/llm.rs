@@ -44,7 +44,11 @@ async fn call_llm_with_history_impl(
     history: &[ChatMessage],
     stream_output: bool,
 ) -> Result<String> {
-    let working = WorkingStatus::start(format!("model {}", cfg.model));
+    let working = if stream_output {
+        None
+    } else {
+        Some(WorkingStatus::start("waiting response"))
+    };
     let api_key = resolve_api_key(cfg)?;
     let mut messages = vec![json!({"role":"system","content":system_prompt})];
     for m in history {
@@ -57,8 +61,9 @@ async fn call_llm_with_history_impl(
         "stream": stream_output
     });
 
+    let timeout_secs = if stream_output { 900 } else { 120 };
     let client = Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
 
@@ -91,7 +96,9 @@ async fn call_llm_with_history_impl(
         extract_content(&val).context("Cannot parse response content")?
     };
 
-    working.finish();
+    if let Some(working) = working {
+        working.finish();
+    }
     Ok(out.trim().to_string())
 }
 
