@@ -492,6 +492,10 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are a senior code reviewer.");
     } else if mode == "edit" {
         prompt.push_str("\nYou are a careful code editor.");
+    } else if mode == "chat-lite" {
+        prompt.push_str("\nYou are in concise chat mode.");
+        prompt.push_str("\nDo not output tool calls, function calls, or command blocks.");
+        prompt.push_str("\nAnswer directly in natural language.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
         prompt.push_str("\nWork as an agent in this loop: understand task -> inspect code -> edit -> verify -> summarize.");

@@ -17,7 +17,7 @@ use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
     try_rg_files, try_rg_grep,
 };
-use crate::llm::{ChatMessage, call_llm_with_history_stream};
+use crate::llm::{ChatMessage, call_llm_with_history, call_llm_with_history_stream};
 use crate::prompt_store::list_prompt_names;
 use crate::util::{
     WorkingStatus, ask, ask_or_eof, prefix_chars, tagged_prompt, truncate_preview,
@@ -92,6 +92,12 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
             continue;
         }
 
+        let use_agent = should_use_agent_for_turn(&cfg, &history, input.trim(), exec_mode).await;
+        let use_agent = match use_agent {
+            Ok(v) => v,
+            Err(_) => should_use_agent_for_input(input.trim(), exec_mode),
+        };
+
         let ctx_working = WorkingStatus::start("collecting workspace context");
         let augmented_input = augment_user_input_with_workspace_context(&input)?;
         ctx_working.finish();
@@ -101,10 +107,10 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
         });
 
         maybe_compact_history(&mut history, &cfg);
-        if should_use_agent_for_input(&input, exec_mode) {
+        if use_agent {
             run_agent_turn(&mut cfg, &mut history, "chat").await?;
         } else {
-            run_chat_turn(&mut cfg, &mut history, "chat").await?;
+            run_chat_turn(&mut cfg, &mut history, "chat-lite").await?;
         }
         save_session(&active_session, &history)?;
         print_changed_files_delta(&changed_before)?;
@@ -1059,7 +1065,11 @@ fn contains_legacy_shell_block(text: &str) -> bool {
 
 fn contains_tool_call_hint(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    t.contains("tool_calls") || t.contains("\"tool\"") || t.contains("```json") || t.contains("``json")
+    t.contains("tool_calls")
+        || t.contains("\"tool\"")
+        || t.contains("```json")
+        || t.contains("``json")
+        || t.contains("<|tool_call_argument_begin|>")
 }
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
@@ -1067,6 +1077,7 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     // Some models emit malformed fence as ``json ... ``; accept it as compatibility fallback.
     collect_tool_calls_from_fence(text, "``json", "``", true, &mut out);
     collect_tool_calls_from_inline_json(text, &mut out);
+    collect_tool_calls_from_special_tokens(text, &mut out);
     out
 }
 fn collect_tool_calls_from_fence(
@@ -1149,12 +1160,91 @@ fn should_use_agent_for_input(input: &str, mode: ChatExecutionMode) -> bool {
     }
 }
 
+async fn should_use_agent_for_turn(
+    cfg: &Config,
+    history: &[ChatMessage],
+    input: &str,
+    mode: ChatExecutionMode,
+) -> Result<bool> {
+    match mode {
+        ChatExecutionMode::AgentForce => Ok(true),
+        ChatExecutionMode::ChatOnly => Ok(false),
+        ChatExecutionMode::AgentAuto => {
+            if looks_like_agent_task(input) {
+                return Ok(true);
+            }
+            if let Some(v) = classify_mode_with_llm(cfg, history, input).await? {
+                return Ok(v);
+            }
+            Ok(false)
+        }
+    }
+}
+
+async fn classify_mode_with_llm(
+    cfg: &Config,
+    history: &[ChatMessage],
+    input: &str,
+) -> Result<Option<bool>> {
+    let mut router_history: Vec<ChatMessage> = history
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .cloned()
+        .collect();
+    router_history.push(ChatMessage {
+        role: "user".to_string(),
+        content: format!(
+            "Route this request for terminal assistant mode.\n\
+             Request: {input}\n\
+             Output JSON only: {{\"mode\":\"agent\"|\"chat\",\"reason\":\"short\"}}"
+        ),
+    });
+    let system = "You are a strict mode router for coding assistant.\n\
+Choose \"agent\" when task likely needs repo inspection, filesystem commands, file edits, test/build execution, or multi-step actions.\n\
+Choose \"chat\" for explanation-only or conceptual Q&A.\n\
+Output JSON only.";
+    let out = call_llm_with_history(cfg, system, &router_history).await?;
+    Ok(parse_router_mode(&out))
+}
+
+fn parse_router_mode(text: &str) -> Option<bool> {
+    if let Ok(v) = serde_json::from_str::<Value>(text.trim())
+        && let Some(mode) = v.get("mode").and_then(|m| m.as_str())
+    {
+        return Some(mode.eq_ignore_ascii_case("agent"));
+    }
+
+    if let Some(start) = text.find('{')
+        && let Some(end) = find_matching_brace(text, start)
+        && let Ok(v) = serde_json::from_str::<Value>(&text[start..=end])
+        && let Some(mode) = v.get("mode").and_then(|m| m.as_str())
+    {
+        return Some(mode.eq_ignore_ascii_case("agent"));
+    }
+
+    let t = text.to_ascii_lowercase();
+    if t.contains("\"mode\":\"agent\"") || t.contains("mode: agent") {
+        return Some(true);
+    }
+    if t.contains("\"mode\":\"chat\"") || t.contains("mode: chat") {
+        return Some(false);
+    }
+    None
+}
+
 fn looks_like_agent_task(input: &str) -> bool {
     let lower = input.to_ascii_lowercase();
     let en_hit = [
         "fix ",
         "implement",
         "refactor",
+        "analyze repo",
+        "analyze project",
+        "analyze this directory",
+        "inspect repo",
+        "inspect project",
         "edit ",
         "change ",
         "update ",
@@ -1172,6 +1262,11 @@ fn looks_like_agent_task(input: &str) -> bool {
         "修复",
         "实现",
         "重构",
+        "分析目录",
+        "分析项目",
+        "看看目录",
+        "检查仓库",
+        "分析仓库",
         "修改",
         "编辑",
         "补丁",
@@ -1237,6 +1332,34 @@ fn collect_tool_calls_from_inline_json(text: &str, out: &mut Vec<ToolCall>) {
             continue;
         }
         i += 1;
+    }
+}
+
+fn collect_tool_calls_from_special_tokens(text: &str, out: &mut Vec<ToolCall>) {
+    let open = "<|tool_call_argument_begin|>";
+    let close = "<|tool_call_end|>";
+    let mut i = 0usize;
+    while i < text.len() {
+        let slice = &text[i..];
+        let Some(pos) = slice.find(open) else {
+            break;
+        };
+        let start = i + pos + open.len();
+        let rest = &text[start..];
+        let Some(end_rel) = rest.find(close) else {
+            break;
+        };
+        let body = rest[..end_rel].trim();
+        if let Ok(v) = serde_json::from_str::<Value>(body)
+            && let Some(command) = v.get("command").and_then(|x| x.as_str())
+            && !command.trim().is_empty()
+        {
+            out.push(ToolCall {
+                tool: "shell".to_string(),
+                command: command.to_string(),
+            });
+        }
+        i = start + end_rel + close.len();
     }
 }
 
