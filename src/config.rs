@@ -492,13 +492,26 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are a senior code reviewer.");
     } else if mode == "edit" {
         prompt.push_str("\nYou are a careful code editor.");
+    } else if mode == "chat-lite" {
+        prompt.push_str("\nYou are in concise chat mode.");
+        prompt.push_str("\nDo not output tool calls, function calls, or command blocks.");
+        prompt.push_str("\nAnswer directly in natural language.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
+        prompt.push_str("\nWork as an agent in this loop: understand task -> inspect code -> edit -> verify -> summarize.");
+        prompt.push_str("\nBefore using tools, briefly state intent in one line.");
+        prompt.push_str("\nAfter tool outputs, decide either next tool call or final answer; avoid redundant steps.");
         prompt.push_str("\nIf terminal execution is needed, output structured JSON tool calls only.");
         prompt.push_str(
             "\nFormat: ```json {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]} ```",
         );
         prompt.push_str("\nDo not output bash/powershell/python command blocks for auto execution.");
+        prompt.push_str("\nKeep tool_calls commands short and robust; avoid long base64 payloads.");
+        prompt.push_str("\nAvoid multiline python -c and complex quote escaping on Windows PowerShell.");
+        prompt.push_str("\nFor file edits, prefer creating a small script file first, then executing it in a second command.");
+        prompt.push_str("\nStable write workflow (Windows preferred): step1 write script with PowerShell here-string -> step2 run script -> step3 verify file content with type/Get-Content.");
+        prompt.push_str("\nExample step1: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"$py = @\'...\'@; Set-Content -Encoding utf8 systems_gen.py $py\"}]}");
+        prompt.push_str("\nExample step2: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"python systems_gen.py\"}]}");
     }
     if cfg.allow_nsfw {
         prompt.push_str(

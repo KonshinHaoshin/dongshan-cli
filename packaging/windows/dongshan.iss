@@ -3,7 +3,7 @@
 #define MyAppVersion "0.0.0-dev"
 #endif
 #ifndef MyAppExe
-#define MyAppExe "target\release\dongshan.exe"
+#define MyAppExe "..\..\target\release\dongshan.exe"
 #endif
 
 [Setup]
