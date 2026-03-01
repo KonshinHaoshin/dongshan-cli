@@ -15,6 +15,14 @@ pub struct Cli {
 pub enum Commands {
     /// Interactive onboarding for provider/api key/prompt selection
     Onboard,
+    /// Non-interactive one-shot agent run
+    Agent {
+        /// Task for the agent to execute
+        task: String,
+        /// Session name to persist run history
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
     /// Interactive multi-turn chat
     Chat {
         /// Session name to persist chat history

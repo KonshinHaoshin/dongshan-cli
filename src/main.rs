@@ -13,7 +13,7 @@ mod webui;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::chat::run_chat;
+use crate::chat::{run_agent_task, run_chat};
 use crate::cli::{Cli, Commands};
 use crate::commands::{
     handle_config, handle_fs, handle_models, handle_prompt, run_doctor, run_edit, run_onboard,
@@ -31,6 +31,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Onboard => run_onboard().await?,
+        Commands::Agent { task, session } => {
+            let cfg = load_config_or_default()?;
+            run_agent_task(cfg, &session, &task).await?;
+        }
         Commands::Chat { session } => {
             let cfg = load_config_or_default()?;
             run_chat(cfg, &session).await?;

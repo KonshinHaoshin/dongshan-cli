@@ -79,8 +79,15 @@ GitHub Actions 会自动上传：
 dongshan config init
 dongshan onboard
 dongshan config set --auto-check-update true
+dongshan agent "检查这个仓库并给出最小重构方案"
 dongshan chat
 dongshan web --port 3721
+```
+
+一次性 Agent 模式：
+
+```powershell
+dongshan agent "修复测试失败并总结改动" --session ci-fix
 ```
 
 ## Web 控制台
@@ -122,6 +129,10 @@ http://127.0.0.1:3721
 
 - `/help`
 - `/new [name]`
+- `/session list`
+- `/session use <name>`
+- `/session rm <name>`
+- `/mode show|chat|agent-auto|agent-force`
 - `/read <file>`
 - `/list [path]`
 - `/grep <pattern> [path]`
@@ -130,6 +141,16 @@ http://127.0.0.1:3721
 - `/model use <name>`
 - `/clear`
 - `/exit`
+
+Chat 内 Agent 循环行为：
+
+- 现在采用明确阶段：`reasoning -> tool execution -> verification -> final`。
+- 工具执行后会自动尝试一次项目验证（能识别才执行）：
+  - Rust: `cargo check`
+  - TypeScript (pnpm): `pnpm -s tsc --noEmit`
+  - TypeScript (npm): `npm exec -y tsc --noEmit`
+  - Python: `pytest -q`
+- 验证输出会回灌到下一步推理，形成闭环。
 
 
 

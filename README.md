@@ -89,8 +89,15 @@ GitHub Actions will build and upload:
 dongshan config init
 dongshan onboard
 dongshan config set --auto-check-update true
+dongshan agent "Inspect this repo and propose minimal refactor for startup latency."
 dongshan chat
 dongshan web --port 3721
+```
+
+One-shot agent mode:
+
+```powershell
+dongshan agent "Fix failing tests and summarize changes" --session ci-fix
 ```
 
 ## Web Console
@@ -131,6 +138,10 @@ Slash commands:
 
 - `/help`
 - `/new [name]`
+- `/session list`
+- `/session use <name>`
+- `/session rm <name>`
+- `/mode show|chat|agent-auto|agent-force`
 - `/read <file>`
 - `/list [path]`
 - `/grep <pattern> [path]`
@@ -139,6 +150,16 @@ Slash commands:
 - `/model use <name>`
 - `/clear`
 - `/exit`
+
+Agent loop behavior in chat:
+
+- The assistant now follows explicit phases: `reasoning -> tool execution -> verification -> final`.
+- After tool execution, it runs one project verification command automatically when detectable:
+  - Rust: `cargo check`
+  - TypeScript (pnpm): `pnpm -s tsc --noEmit`
+  - TypeScript (npm): `npm exec -y tsc --noEmit`
+  - Python: `pytest -q`
+- Verification output is fed back into the next reasoning step.
 
 
 Natural language examples:

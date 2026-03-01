@@ -1,6 +1,7 @@
 ﻿use std::fs;
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,25 +20,58 @@ use crate::fs_tools::{
 use crate::llm::{ChatMessage, call_llm_with_history_stream};
 use crate::prompt_store::list_prompt_names;
 use crate::util::{
-    WorkingStatus, ask, prefix_chars, tagged_prompt, truncate_preview, truncate_with_suffix,
+    WorkingStatus, ask, ask_or_eof, prefix_chars, tagged_prompt, truncate_preview,
+    truncate_with_suffix,
 };
 const MAX_AUTO_TOOL_STEPS: usize = 3;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
+const MAX_INVALID_FORMAT_RETRIES: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatExecutionMode {
+    ChatOnly,
+    AgentAuto,
+    AgentForce,
+}
+
+impl ChatExecutionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChatExecutionMode::ChatOnly => "chat",
+            ChatExecutionMode::AgentAuto => "agent-auto",
+            ChatExecutionMode::AgentForce => "agent-force",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "chat" | "chat-only" => Some(ChatExecutionMode::ChatOnly),
+            "auto" | "agent-auto" => Some(ChatExecutionMode::AgentAuto),
+            "agent" | "agent-force" => Some(ChatExecutionMode::AgentForce),
+            _ => None,
+        }
+    }
+}
 
 pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
     let mut active_session = resolve_session_name(session)?;
+    let mut exec_mode = ChatExecutionMode::AgentAuto;
     println!("== dongshan chat ({active_session}) ==");
     println!("Type /help for slash commands. Type /exit to quit.");
+    println!("Execution mode: {}", exec_mode.as_str());
     let mut history = load_session_or_default(&active_session)?;
     loop {
-        let input = ask("you> ")?;
+        let Some(input) = ask_or_eof("you> ")? else {
+            break;
+        };
         if input.trim().eq_ignore_ascii_case("/exit") {
             break;
         }
         if input.trim().is_empty() {
             continue;
         }
+        let changed_before = current_changed_file_set()?;
 
         if input.trim_start().starts_with('/') {
             handle_chat_slash_command(
@@ -45,13 +79,16 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut cfg,
                 &mut history,
                 &mut active_session,
+                &mut exec_mode,
             ).await?;
             save_session(&active_session, &history)?;
+            print_changed_files_delta(&changed_before)?;
             continue;
         }
 
         if handle_natural_language_tool_command(input.trim(), &mut cfg, &mut history).await? {
             save_session(&active_session, &history)?;
+            print_changed_files_delta(&changed_before)?;
             continue;
         }
 
@@ -64,8 +101,13 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
         });
 
         maybe_compact_history(&mut history, &cfg);
-        run_agent_turn(&mut cfg, &mut history, "chat").await?;
+        if should_use_agent_for_input(&input, exec_mode) {
+            run_agent_turn(&mut cfg, &mut history, "chat").await?;
+        } else {
+            run_chat_turn(&mut cfg, &mut history, "chat").await?;
+        }
         save_session(&active_session, &history)?;
+        print_changed_files_delta(&changed_before)?;
     }
 
     Ok(())
@@ -476,6 +518,7 @@ async fn handle_chat_slash_command(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     active_session: &mut String,
+    exec_mode: &mut ChatExecutionMode,
 ) -> Result<()> {
     let mut parts = input.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -489,6 +532,11 @@ async fn handle_chat_slash_command(
             println!("/exit");
             println!("/new [name]");
             println!("/clear");
+            println!("/session list");
+            println!("/session use <name>");
+            println!("/session rm <name>");
+            println!("/mode show");
+            println!("/mode chat|agent-auto|agent-force");
             println!("/read <file> [question]");
             println!("/askfile <file> <question>");
             println!("/list [path]");
@@ -514,6 +562,74 @@ async fn handle_chat_slash_command(
         "/clear" => {
             history.clear();
             println!("Session history cleared.");
+        }
+        "/session" => {
+            let Some(sub) = parts.next() else {
+                println!("Usage: /session <list|use|rm>");
+                return Ok(());
+            };
+            match sub {
+                "list" => {
+                    let sessions = list_saved_sessions()?;
+                    if sessions.is_empty() {
+                        println!("No saved sessions.");
+                    } else {
+                        println!("Saved sessions:");
+                        for name in sessions {
+                            if name == *active_session {
+                                println!("* {name}");
+                            } else {
+                                println!("  {name}");
+                            }
+                        }
+                    }
+                }
+                "use" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /session use <name>");
+                        return Ok(());
+                    };
+                    let next_session = resolve_session_name(name)?;
+                    let next_history = load_session_or_default(&next_session)?;
+                    *history = next_history;
+                    *active_session = next_session.clone();
+                    println!(
+                        "Switched session: {} ({} messages)",
+                        next_session,
+                        history.len()
+                    );
+                }
+                "rm" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /session rm <name>");
+                        return Ok(());
+                    };
+                    let target = resolve_session_name(name)?;
+                    if target == *active_session {
+                        println!("Cannot remove current active session: {}", target);
+                        return Ok(());
+                    }
+                    if remove_session_file(&target)? {
+                        println!("Removed session: {}", target);
+                    } else {
+                        println!("Session not found: {}", target);
+                    }
+                }
+                _ => {
+                    println!("Usage: /session <list|use|rm>");
+                }
+            }
+        }
+        "/mode" => {
+            let sub = parts.next().unwrap_or("show");
+            if sub.eq_ignore_ascii_case("show") {
+                println!("Execution mode: {}", exec_mode.as_str());
+            } else if let Some(next_mode) = ChatExecutionMode::parse(sub) {
+                *exec_mode = next_mode;
+                println!("Execution mode switched to: {}", exec_mode.as_str());
+            } else {
+                println!("Usage: /mode show|chat|agent-auto|agent-force");
+            }
         }
         "/read" => {
             let Some(file) = parts.next() else {
@@ -638,6 +754,8 @@ struct ExecResult {
     executed_any: bool,
     had_blocks: bool,
     skipped_any: bool,
+    invalid_format: bool,
+    had_failures: bool,
     display_text: String,
     history_text: String,
 }
@@ -657,6 +775,20 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
                 executed_any: false,
                 had_blocks: true,
                 skipped_any: true,
+                invalid_format: true,
+                had_failures: false,
+                display_text: format!("\n{}", msg),
+                history_text: format!("tool[shell.auto_exec] output:\n{}", msg),
+            });
+        }
+        if contains_tool_call_hint(answer) {
+            let msg = "Detected malformed or incomplete tool_calls JSON. Skipped; ask model to retry with valid JSON tool_calls.\n";
+            return Ok(ExecResult {
+                executed_any: false,
+                had_blocks: true,
+                skipped_any: true,
+                invalid_format: true,
+                had_failures: false,
                 display_text: format!("\n{}", msg),
                 history_text: format!("tool[shell.auto_exec] output:\n{}", msg),
             });
@@ -665,6 +797,8 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
             executed_any: false,
             had_blocks: false,
             skipped_any: false,
+            invalid_format: false,
+            had_failures: false,
             display_text: String::new(),
             history_text: String::new(),
         });
@@ -759,6 +893,8 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
         executed_any: executed_count > 0,
         had_blocks: true,
         skipped_any: skipped_count > 0,
+        invalid_format: false,
+        had_failures: failed_commands > 0,
         display_text: format!("\n{}", display),
         history_text: format!("tool[shell.auto_exec] output:\n{}", history),
     })
@@ -770,6 +906,19 @@ fn precheck_command(cmd: &str) -> Option<String> {
         return Some("empty command".to_string());
     }
     let first = tokens[0].to_ascii_lowercase();
+    let lower = cmd.to_ascii_lowercase();
+
+    if (lower.contains("base64") || lower.contains("frombase64string") || lower.contains("[convert]::frombase64string"))
+        && cmd.len() > 700
+    {
+        return Some("base64 payload too long; use small script file workflow instead".to_string());
+    }
+
+    if (first == "python" || first == "python3") && lower.contains(" -c ") {
+        if cmd.contains('\n') || cmd.len() > 360 {
+            return Some("python -c is too long/multiline; write .py file then run it".to_string());
+        }
+    }
 
     if first == "python" || first == "python3" {
         if tokens.len() >= 2 {
@@ -793,7 +942,6 @@ fn precheck_command(cmd: &str) -> Option<String> {
 
     None
 }
-
 fn looks_like_command_failure(output: &str) -> bool {
     let s = output.to_ascii_lowercase();
     s.contains("commandnotfoundexception")
@@ -816,9 +964,10 @@ async fn run_agent_turn_with_system(
 ) -> Result<()> {
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
+    let mut invalid_format_retries = 0usize;
     loop {
         maybe_compact_history(history, cfg);
-        println!("(phase: model reasoning step {})", steps + 1);
+        println!("(phase: reasoning step {})", steps + 1);
         print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
         let answer = match call_llm_with_history_stream(cfg, system, history).await {
             Ok(v) => v,
@@ -844,13 +993,25 @@ async fn run_agent_turn_with_system(
         }
 
         if exec_result.executed_any {
-            println!("(phase: executing suggested commands)");
+            println!("(phase: tool execution)");
             println!("assistant> {}", exec_result.display_text);
+            println!("(phase: verification)");
+            let verification = run_auto_verification()?;
+            if !verification.trim().is_empty() {
+                println!("assistant> {}", verification);
+            }
+            let recovery_hint = if exec_result.had_failures {
+                "\nSome commands failed. Prefer narrower retries: check file/path existence first, then rerun minimal commands."
+            } else {
+                ""
+            };
             history.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
-                    "{}\nContinue based on tool outputs above. If more execution is needed, emit JSON tool_calls. If complete, give final answer directly.",
-                    exec_result.history_text
+                    "{}\n{}{}\nContinue based on tool outputs above. If more execution is needed, emit JSON tool_calls. If complete, give final answer directly with short summary, changed files, and verification result.",
+                    exec_result.history_text,
+                    verification,
+                    recovery_hint
                 ),
             });
             steps += 1;
@@ -861,6 +1022,15 @@ async fn run_agent_turn_with_system(
                 );
                 return Ok(());
             }
+            continue;
+        }
+
+        if exec_result.invalid_format && invalid_format_retries < MAX_INVALID_FORMAT_RETRIES {
+            invalid_format_retries += 1;
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: "Your last response had invalid tool_calls format. Use only a strict JSON code fence like ```json {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]} ``` or provide a final answer with no tool_calls.".to_string(),
+            });
             continue;
         }
 
@@ -887,37 +1057,230 @@ fn contains_legacy_shell_block(text: &str) -> bool {
         || t.contains("```cmd")
 }
 
+fn contains_tool_call_hint(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("tool_calls") || t.contains("\"tool\"") || t.contains("```json") || t.contains("``json")
+}
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
+    collect_tool_calls_from_fence(text, "```json", "```", false, &mut out);
+    // Some models emit malformed fence as ``json ... ``; accept it as compatibility fallback.
+    collect_tool_calls_from_fence(text, "``json", "``", true, &mut out);
+    collect_tool_calls_from_inline_json(text, &mut out);
+    out
+}
+fn collect_tool_calls_from_fence(
+    text: &str,
+    open: &str,
+    close: &str,
+    skip_if_prev_backtick: bool,
+    out: &mut Vec<ToolCall>,
+) {
     let mut i = 0usize;
     while i < text.len() {
         let slice = &text[i..];
-        let Some(pos) = slice.find("```json") else {
+        let Some(pos) = slice.find(open) else {
             break;
         };
-        let start = i + pos + "```json".len();
-        let after_tag = &text[start..];
-        let line_skip = if let Some(nl) = after_tag.find('\n') {
-            nl + 1
-        } else {
+        let open_idx = i + pos;
+        if skip_if_prev_backtick && open_idx > 0 && text.as_bytes()[open_idx - 1] == b'`' {
+            i = open_idx + open.len();
+            continue;
+        }
+
+        let mut json_start = open_idx + open.len();
+        while json_start < text.len() {
+            let b = text.as_bytes()[json_start];
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                json_start += 1;
+            } else {
+                break;
+            }
+        }
+        if json_start >= text.len() {
             break;
-        };
-        let json_start = start + line_skip;
+        }
+
         let rest = &text[json_start..];
-        let Some(end_rel) = rest.find("```") else {
+        let Some(end_rel) = rest.find(close) else {
             break;
         };
+
         let block = rest[..end_rel].trim();
         if !block.is_empty()
             && let Ok(value) = serde_json::from_str::<Value>(block)
         {
-            collect_tool_calls_from_value(&value, &mut out);
+            collect_tool_calls_from_value(&value, out);
         }
-        i = json_start + end_rel + 3;
+        i = json_start + end_rel + close.len();
     }
-    out
 }
 
+async fn run_chat_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
+    let system = build_system_prompt(cfg, mode);
+    maybe_compact_history(history, cfg);
+    println!("(phase: response)");
+    print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+    let answer = match call_llm_with_history_stream(cfg, &system, history).await {
+        Ok(v) => v,
+        Err(err) => {
+            println!("\n");
+            println!(
+                "assistant> Request interrupted: {}",
+                truncate_with_suffix(&err.to_string(), 220, " ...")
+            );
+            println!("assistant> You can continue chatting and send the next message.\n");
+            return Ok(());
+        }
+    };
+    println!("\n");
+    history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: answer,
+    });
+    Ok(())
+}
+
+fn should_use_agent_for_input(input: &str, mode: ChatExecutionMode) -> bool {
+    match mode {
+        ChatExecutionMode::AgentForce => true,
+        ChatExecutionMode::ChatOnly => false,
+        ChatExecutionMode::AgentAuto => looks_like_agent_task(input),
+    }
+}
+
+fn looks_like_agent_task(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    let en_hit = [
+        "fix ",
+        "implement",
+        "refactor",
+        "edit ",
+        "change ",
+        "update ",
+        "patch ",
+        "apply ",
+        "add feature",
+        "write code",
+        "run tests",
+        "build ",
+        "compile ",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    let zh_hit = [
+        "修复",
+        "实现",
+        "重构",
+        "修改",
+        "编辑",
+        "补丁",
+        "写代码",
+        "跑测试",
+        "编译",
+        "构建",
+    ]
+    .iter()
+    .any(|k| input.contains(k));
+    en_hit || zh_hit
+}
+
+fn run_auto_verification() -> Result<String> {
+    let Some((label, cmd)) = pick_verification_command() else {
+        return Ok("verification: skipped (no supported project checker detected)".to_string());
+    };
+    let out = run_shell_command(cmd)?;
+    let status = if looks_like_command_failure(&out) {
+        "failed"
+    } else {
+        "ok"
+    };
+    let clipped = clip_output(&out, 5000);
+    Ok(format!(
+        "verification[{label}] {status}\n$ {cmd}\n{clipped}"
+    ))
+}
+
+fn pick_verification_command() -> Option<(&'static str, &'static str)> {
+    if Path::new("Cargo.toml").exists() {
+        return Some(("rust", "cargo check"));
+    }
+    if Path::new("pnpm-lock.yaml").exists() && Path::new("tsconfig.json").exists() {
+        return Some(("typescript", "pnpm -s tsc --noEmit"));
+    }
+    if Path::new("package.json").exists() && Path::new("tsconfig.json").exists() {
+        return Some(("typescript", "npm exec -y tsc --noEmit"));
+    }
+    if Path::new("pyproject.toml").exists() || Path::new("pytest.ini").exists() {
+        return Some(("python", "pytest -q"));
+    }
+    None
+}
+fn collect_tool_calls_from_inline_json(text: &str, out: &mut Vec<ToolCall>) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let Some(end) = find_matching_brace(text, i) else {
+            i += 1;
+            continue;
+        };
+        let candidate = &text[i..=end];
+        if candidate.contains("\"tool_calls\"")
+            && let Ok(value) = serde_json::from_str::<Value>(candidate)
+        {
+            collect_tool_calls_from_value(&value, out);
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn find_matching_brace(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(start).copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
 fn collect_tool_calls_from_value(value: &Value, out: &mut Vec<ToolCall>) {
     match value {
         Value::Array(items) => {
@@ -1170,6 +1533,10 @@ fn session_path(session: &str) -> Result<std::path::PathBuf> {
     Ok(config_dir()?.join("sessions").join(format!("{session}.json")))
 }
 
+fn sessions_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("sessions"))
+}
+
 fn resolve_session_name(requested: &str) -> Result<String> {
     let name = if requested == "default" || requested == "auto" {
         workspace_session_base()?
@@ -1235,6 +1602,115 @@ fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
     }
     let text = serde_json::to_string_pretty(messages)?;
     fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Result<()> {
+    let active_session = resolve_session_name(session)?;
+    println!("== dongshan agent ({active_session}) ==");
+    let mut history = load_session_or_default(&active_session)?;
+    let augmented_input = augment_user_input_with_workspace_context(task)?;
+    history.push(ChatMessage {
+        role: "user".to_string(),
+        content: augmented_input,
+    });
+
+    maybe_compact_history(&mut history, &cfg);
+    run_agent_turn(&mut cfg, &mut history, "chat").await?;
+    save_session(&active_session, &history)?;
+
+    let changed = list_workspace_changed_files()?;
+    if changed.is_empty() {
+        println!("agent> no tracked workspace changes detected.");
+    } else {
+        println!("agent> changed files:");
+        for file in changed {
+            println!("- {}", file);
+        }
+    }
+    Ok(())
+}
+
+fn list_saved_sessions() -> Result<Vec<String>> {
+    let dir = sessions_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut names = Vec::new();
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("Failed to read session dir {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("Failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        names.push(stem.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn remove_session_file(session: &str) -> Result<bool> {
+    let path = session_path(session)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    Ok(true)
+}
+
+fn list_workspace_changed_files() -> Result<Vec<String>> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output();
+    let Ok(out) = out else {
+        return Ok(Vec::new());
+    };
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut files = Vec::new();
+    for line in text.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let path = line[3..].trim();
+        if !path.is_empty() {
+            files.push(path.to_string());
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn current_changed_file_set() -> Result<BTreeSet<String>> {
+    Ok(list_workspace_changed_files()?.into_iter().collect())
+}
+
+fn print_changed_files_delta(before: &BTreeSet<String>) -> Result<()> {
+    let after = current_changed_file_set()?;
+    if &after == before {
+        return Ok(());
+    }
+
+    println!("changed files:");
+    for p in after.iter().filter(|p| !before.contains(*p)) {
+        println!("+ {}", p);
+    }
+    for p in after.iter().filter(|p| before.contains(*p)) {
+        println!("~ {}", p);
+    }
+    for p in before.iter().filter(|p| !after.contains(*p)) {
+        println!("- {}", p);
+    }
     Ok(())
 }
 

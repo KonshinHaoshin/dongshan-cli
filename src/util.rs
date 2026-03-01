@@ -17,6 +17,19 @@ pub fn ask(label: &str) -> Result<String> {
     Ok(input.trim_end_matches(['\n', '\r']).to_string())
 }
 
+pub fn ask_or_eof(label: &str) -> Result<Option<String>> {
+    print!("{label}");
+    io::stdout().flush().context("Failed to flush stdout")?;
+    let mut input = String::new();
+    let n = io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read stdin")?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(input.trim_end_matches(['\n', '\r']).to_string()))
+}
+
 pub fn blue_label(text: &str) -> String {
     if std::env::var_os("NO_COLOR").is_some() {
         return text.to_string();
