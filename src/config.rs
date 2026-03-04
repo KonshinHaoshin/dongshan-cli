@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -498,20 +498,25 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nAnswer directly in natural language.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
-        prompt.push_str("\nWork as an agent in this loop: understand task -> inspect code -> edit -> verify -> summarize.");
+        prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
-        prompt.push_str("\nAfter tool outputs, decide either next tool call or final answer; avoid redundant steps.");
-        prompt.push_str("\nIf terminal execution is needed, output structured JSON tool calls only.");
-        prompt.push_str(
-            "\nFormat: ```json {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]} ```",
-        );
-        prompt.push_str("\nDo not output bash/powershell/python command blocks for auto execution.");
-        prompt.push_str("\nKeep tool_calls commands short and robust; avoid long base64 payloads.");
-        prompt.push_str("\nAvoid multiline python -c and complex quote escaping on Windows PowerShell.");
-        prompt.push_str("\nFor file edits, prefer creating a small script file first, then executing it in a second command.");
-        prompt.push_str("\nStable write workflow (Windows preferred): step1 write script with PowerShell here-string -> step2 run script -> step3 verify file content with type/Get-Content.");
-        prompt.push_str("\nExample step1: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"$py = @\'...\'@; Set-Content -Encoding utf8 systems_gen.py $py\"}]}");
-        prompt.push_str("\nExample step2: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"python systems_gen.py\"}]}");
+        prompt.push_str("\nUse native tool_calls first; use shell only when native tools are insufficient.");
+        prompt.push_str("\nReturn strict JSON tool_calls when action is needed. No markdown command blocks.");
+        prompt.push_str("\nSupported tools:");
+        prompt.push_str("\n- fs.read_file args: {path}");
+        prompt.push_str("\n- fs.create_file args: {path, content, overwrite?}");
+        prompt.push_str("\n- fs.edit_file args: {path, old_str, new_str, replace_all?}");
+        prompt.push_str("\n- fs.apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}");
+        prompt.push_str("\n- fs.list_files args: {path?}");
+        prompt.push_str("\n- fs.grep args: {pattern, path?}");
+        prompt.push_str("\n- fs.move args: {from, to}");
+        prompt.push_str("\n- fs.delete args: {path, recursive?}");
+        prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
+        prompt.push_str("\n- shell args: {command} (fallback)");
+        prompt.push_str("\nPreferred format: {\"tool_calls\":[{\"tool\":\"fs.read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
+        prompt.push_str("\nPatch format: {\"tool_calls\":[{\"tool\":\"fs.apply_patch\",\"args\":{\"path\":\"src/main.rs\",\"edits\":[{\"old\":\"foo\",\"new\":\"bar\"}]}}]}");
+        prompt.push_str("\nShell fallback format: {\"tool_calls\":[{\"tool\":\"run_command\",\"args\":{\"command\":\"rg --files\"}}]}");
+        prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");
     }
     if cfg.allow_nsfw {
         prompt.push_str(
@@ -520,3 +525,4 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
     }
     prompt
 }
+
