@@ -500,22 +500,20 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
         prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
-        prompt.push_str("\nUse native tool_calls first; use shell only when native tools are insufficient.");
-        prompt.push_str("\nReturn strict JSON tool_calls when action is needed. No markdown command blocks.");
+        prompt.push_str("\nUse OpenAI native function-calling first; use shell only when native fs functions are insufficient.");
+        prompt.push_str("\nIf function-calling is unavailable, fallback to strict JSON tool_calls. Never use markdown shell blocks.");
         prompt.push_str("\nSupported tools:");
-        prompt.push_str("\n- fs.read_file args: {path}");
-        prompt.push_str("\n- fs.create_file args: {path, content, overwrite?}");
-        prompt.push_str("\n- fs.edit_file args: {path, old_str, new_str, replace_all?}");
-        prompt.push_str("\n- fs.apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}");
-        prompt.push_str("\n- fs.list_files args: {path?}");
-        prompt.push_str("\n- fs.grep args: {pattern, path?}");
-        prompt.push_str("\n- fs.move args: {from, to}");
-        prompt.push_str("\n- fs.delete args: {path, recursive?}");
+        prompt.push_str("\n- fs_read_file args: {path}");
+        prompt.push_str("\n- fs_create_file args: {path, content, overwrite?}");
+        prompt.push_str("\n- fs_edit_file args: {path, old_str, new_str, replace_all?}");
+        prompt.push_str("\n- fs_apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}");
+        prompt.push_str("\n- fs_list_files args: {path?}");
+        prompt.push_str("\n- fs_grep args: {pattern, path?}");
+        prompt.push_str("\n- fs_move args: {from, to}");
+        prompt.push_str("\n- fs_delete args: {path, recursive?}");
         prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
-        prompt.push_str("\n- shell args: {command} (fallback)");
-        prompt.push_str("\nPreferred format: {\"tool_calls\":[{\"tool\":\"fs.read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
-        prompt.push_str("\nPatch format: {\"tool_calls\":[{\"tool\":\"fs.apply_patch\",\"args\":{\"path\":\"src/main.rs\",\"edits\":[{\"old\":\"foo\",\"new\":\"bar\"}]}}]}");
-        prompt.push_str("\nShell fallback format: {\"tool_calls\":[{\"tool\":\"run_command\",\"args\":{\"command\":\"rg --files\"}}]}");
+        prompt.push_str("\n- shell args: {command} (legacy fallback)");
+        prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs.read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
         prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");
     }
     if cfg.allow_nsfw {

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use encoding_rs::GBK;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
@@ -19,7 +19,10 @@ use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
     try_rg_files, try_rg_grep,
 };
-use crate::llm::{ChatMessage, call_llm_with_history, call_llm_with_history_stream};
+use crate::llm::{
+    ChatMessage, NativeFunctionCall, build_openai_messages, call_llm_with_history,
+    call_llm_with_history_stream, call_llm_with_messages_native_tools,
+};
 use crate::prompt_store::list_prompt_names;
 use crate::util::{
     WorkingStatus, ask, ask_or_eof, prefix_chars, tagged_prompt, truncate_preview,
@@ -784,6 +787,12 @@ struct ToolResultRecord {
     changed_files: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct NativeToolExecution {
+    call_id: String,
+    output: String,
+}
+
 fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<ExecResult> {
     let calls = extract_tool_calls(answer);
     if calls.is_empty() {
@@ -873,31 +882,7 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
             continue;
         }
 
-        let exec = match tool.as_str() {
-            "shell" => execute_shell_tool_call(cfg, &call),
-            "fs.read_file" => execute_native_fs_read(&call),
-            "fs.create_file" => execute_native_fs_create(&call),
-            "fs.edit_file" => execute_native_fs_edit(&call),
-            "fs.list_files" => execute_native_fs_list(&call),
-            "fs.grep" => execute_native_fs_grep(&call),
-            "fs.apply_patch" => execute_native_fs_apply_patch(&call),
-            "fs.move" => execute_native_fs_move(&call),
-            "fs.delete" => execute_native_fs_delete(&call),
-            "run_command" => execute_structured_run_command(cfg, &call),
-            _ => {
-                let line = format!("Skipped unsupported tool: {}\n", call.tool);
-                display.push_str(&line);
-                records.push(ToolResultRecord {
-                    tool: call.tool.clone(),
-                    status: "skipped".to_string(),
-                    output: line.trim().to_string(),
-                    error: None,
-                    changed_files: Vec::new(),
-                });
-                skipped_count += 1;
-                continue;
-            }
-        };
+        let exec = execute_tool_call_by_name(cfg, &call);
         let before_set = current_changed_file_set().unwrap_or_default();
 
         match exec {
@@ -976,6 +961,185 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
     })
 }
 
+fn native_tool_schemas() -> Vec<Value> {
+    vec![
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_read_file",
+                "description":"Read a UTF-8 text file from workspace",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_create_file",
+                "description":"Create or overwrite a file with content",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"overwrite":{"type":"boolean"}},"required":["path","content"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_edit_file",
+                "description":"Edit one file by replacing old_str with new_str",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","new_str"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_apply_patch",
+                "description":"Apply one or more old/new text edits to a file",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"strict":{"type":"boolean"}},"required":["path","edits"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_list_files",
+                "description":"List files under a path",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_grep",
+                "description":"Search pattern in files under path",
+                "parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_move",
+                "description":"Move or rename a file",
+                "parameters":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"fs_delete",
+                "description":"Delete file or directory",
+                "parameters":{"type":"object","properties":{"path":{"type":"string"},"recursive":{"type":"boolean"}},"required":["path"]}
+            }
+        }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"run_command",
+                "description":"Run a shell command; use only when fs tools are insufficient",
+                "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+            }
+        }),
+    ]
+}
+
+fn execute_native_function_calls(
+    cfg: &mut Config,
+    calls: &[NativeFunctionCall],
+) -> Result<(ExecResult, Vec<NativeToolExecution>)> {
+    if calls.is_empty() {
+        return Ok((
+            ExecResult {
+                executed_any: false,
+                had_blocks: false,
+                skipped_any: false,
+                invalid_format: false,
+                had_failures: false,
+                display_text: String::new(),
+                history_text: String::new(),
+            },
+            Vec::new(),
+        ));
+    }
+
+    let mut parsed: Vec<(String, ToolCall)> = Vec::new();
+    for call in calls {
+        let args = if call.arguments.trim().is_empty() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str::<Value>(&call.arguments)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+        };
+        parsed.push((
+            call.id.clone(),
+            ToolCall {
+                tool: call.name.clone(),
+                command: String::new(),
+                args,
+            },
+        ));
+    }
+
+    let mut display = String::new();
+    let mut tool_msgs: Vec<NativeToolExecution> = Vec::new();
+    let mut executed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failed_calls = 0usize;
+
+    for (call_id, call) in parsed {
+        let before_set = current_changed_file_set().unwrap_or_default();
+        let exec = execute_tool_call_by_name(cfg, &call);
+
+        match exec {
+            Ok(out) => {
+                let status = if is_skipped_tool_output(&out) {
+                    "skipped"
+                } else {
+                    "ok"
+                };
+                if status == "ok" {
+                    executed_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                if status == "ok" && looks_like_command_failure(&out) {
+                    failed_calls += 1;
+                }
+                let after_set = current_changed_file_set().unwrap_or_default();
+                let mut changed_files = changed_files_delta(&before_set, &after_set);
+                if changed_files.is_empty() && status == "ok" {
+                    changed_files = guessed_changed_files_for_call(&call);
+                }
+                display.push_str(&format!("tool[{}][{}]\n{}\n", call.tool, status, out));
+                if !changed_files.is_empty() {
+                    display.push_str(&format!("changed_files: {}\n", changed_files.join(", ")));
+                }
+                tool_msgs.push(NativeToolExecution {
+                    call_id,
+                    output: out,
+                });
+            }
+            Err(err) => {
+                let line = format!("Tool failed [{}]: {}", call.tool, err);
+                display.push_str(&format!("{line}\n"));
+                tool_msgs.push(NativeToolExecution {
+                    call_id,
+                    output: line,
+                });
+                failed_calls += 1;
+            }
+        }
+    }
+
+    Ok((
+        ExecResult {
+            executed_any: executed_count > 0,
+            had_blocks: true,
+            skipped_any: skipped_count > 0,
+            invalid_format: false,
+            had_failures: failed_calls > 0,
+            display_text: format!("\n{}", display),
+            history_text: String::new(),
+        },
+        tool_msgs,
+    ))
+}
+
 fn serialize_tool_results(results: &[ToolResultRecord]) -> String {
     serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string())
 }
@@ -983,6 +1147,23 @@ fn serialize_tool_results(results: &[ToolResultRecord]) -> String {
 fn is_skipped_tool_output(output: &str) -> bool {
     let lower = output.trim().to_ascii_lowercase();
     lower.starts_with("skipped") || lower.starts_with("skip ")
+}
+
+fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String> {
+    let tool = call.tool.trim().to_ascii_lowercase();
+    match tool.as_str() {
+        "shell" => execute_shell_tool_call(cfg, call),
+        "fs.read_file" | "fs_read_file" => execute_native_fs_read(call),
+        "fs.create_file" | "fs_create_file" => execute_native_fs_create(call),
+        "fs.edit_file" | "fs_edit_file" => execute_native_fs_edit(call),
+        "fs.list_files" | "fs_list_files" => execute_native_fs_list(call),
+        "fs.grep" | "fs_grep" => execute_native_fs_grep(call),
+        "fs.apply_patch" | "fs_apply_patch" => execute_native_fs_apply_patch(call),
+        "fs.move" | "fs_move" => execute_native_fs_move(call),
+        "fs.delete" | "fs_delete" => execute_native_fs_delete(call),
+        "run_command" => execute_structured_run_command(cfg, call),
+        _ => Ok(format!("Skipped unsupported tool: {}", call.tool)),
+    }
 }
 
 fn execute_shell_tool_call(cfg: &mut Config, call: &ToolCall) -> Result<String> {
@@ -1365,6 +1546,96 @@ async fn run_agent_turn_with_system(
     history: &mut Vec<ChatMessage>,
     system: &str,
 ) -> Result<()> {
+    match run_agent_turn_with_system_native(cfg, history, system).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            println!(
+                "\nassistant> Native function-calling unavailable, fallback to JSON tool_calls parser: {}\n",
+                truncate_with_suffix(&err.to_string(), 220, " ...")
+            );
+            run_agent_turn_with_system_legacy(cfg, history, system).await
+        }
+    }
+}
+
+async fn run_agent_turn_with_system_native(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    system: &str,
+) -> Result<()> {
+    let tools = native_tool_schemas();
+    let mut messages = build_openai_messages(system, history);
+    let mut steps = 0usize;
+    let mut unsafe_retries = 0usize;
+    loop {
+        maybe_compact_history(history, cfg);
+        println!("(phase: reasoning step {})", steps + 1);
+        print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+        let resp = call_llm_with_messages_native_tools(cfg, &messages, &tools).await?;
+        let answer = resp.content.trim().to_string();
+        if !answer.is_empty() {
+            println!("{}", answer);
+        }
+        println!("\n");
+        messages.push(resp.assistant_message);
+
+        if resp.tool_calls.is_empty() {
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: answer,
+            });
+            return Ok(());
+        }
+
+        let (exec_result, tool_msgs) = execute_native_function_calls(cfg, &resp.tool_calls)?;
+        for m in tool_msgs {
+            messages.push(json!({
+                "role":"tool",
+                "tool_call_id": m.call_id,
+                "content": m.output
+            }));
+        }
+
+        if exec_result.executed_any {
+            let (verification, recovery_hint) = print_execution_and_verification(&exec_result)?;
+            messages.push(json!({
+                "role":"user",
+                "content": format!(
+                    "{}{}\nContinue based on tool outputs above. If more execution is needed, call functions directly. If complete, give final answer directly with short summary, changed files, and verification result.",
+                    verification,
+                    recovery_hint
+                )
+            }));
+            steps += 1;
+            if steps >= MAX_AUTO_TOOL_STEPS {
+                println!(
+                    "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
+                    MAX_AUTO_TOOL_STEPS
+                );
+                return Ok(());
+            }
+            continue;
+        }
+
+        if exec_result.skipped_any && unsafe_retries < 1 {
+            unsafe_retries += 1;
+            messages.push(json!({
+                "role":"user",
+                "content":"Your last tool calls were unsupported or unsafe. Use supported functions only, and only when needed. Otherwise provide direct final analysis/result."
+            }));
+            continue;
+        }
+
+        println!("assistant> Detected tool calls, but all were skipped or unsafe.\n");
+        return Ok(());
+    }
+}
+
+async fn run_agent_turn_with_system_legacy(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    system: &str,
+) -> Result<()> {
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
     let mut invalid_format_retries = 0usize;
@@ -1396,18 +1667,7 @@ async fn run_agent_turn_with_system(
         }
 
         if exec_result.executed_any {
-            println!("(phase: tool execution)");
-            println!("assistant> {}", exec_result.display_text);
-            println!("(phase: verification)");
-            let verification = run_auto_verification()?;
-            if !verification.trim().is_empty() {
-                println!("assistant> {}", verification);
-            }
-            let recovery_hint = if exec_result.had_failures {
-                "\nSome commands failed. Prefer narrower retries: check file/path existence first, then rerun minimal commands."
-            } else {
-                ""
-            };
+            let (verification, recovery_hint) = print_execution_and_verification(&exec_result)?;
             history.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
@@ -1471,10 +1731,7 @@ fn contains_tool_call_hint(text: &str) -> bool {
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
     collect_tool_calls_from_fence(text, "```json", "```", false, &mut out);
-    // Some models emit malformed fence as ``json ... ``; accept it as compatibility fallback.
-    collect_tool_calls_from_fence(text, "``json", "``", true, &mut out);
     collect_tool_calls_from_inline_json(text, &mut out);
-    collect_tool_calls_from_special_tokens(text, &mut out);
     out
 }
 fn collect_tool_calls_from_fence(
@@ -1677,6 +1934,22 @@ fn looks_like_agent_task(input: &str) -> bool {
     en_hit || zh_hit
 }
 
+fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String, String)> {
+    println!("(phase: tool execution)");
+    println!("assistant> {}", exec_result.display_text);
+    println!("(phase: verification)");
+    let verification = run_auto_verification()?;
+    if !verification.trim().is_empty() {
+        println!("assistant> {}", verification);
+    }
+    let recovery_hint = if exec_result.had_failures {
+        "\nSome commands failed. Prefer narrower retries: check file/path existence first, then rerun minimal commands.".to_string()
+    } else {
+        String::new()
+    };
+    Ok((verification, recovery_hint))
+}
+
 fn run_auto_verification() -> Result<String> {
     let Some((label, cmd)) = pick_verification_command() else {
         return Ok("verification: skipped (no supported project checker detected)".to_string());
@@ -1729,35 +2002,6 @@ fn collect_tool_calls_from_inline_json(text: &str, out: &mut Vec<ToolCall>) {
             continue;
         }
         i += 1;
-    }
-}
-
-fn collect_tool_calls_from_special_tokens(text: &str, out: &mut Vec<ToolCall>) {
-    let open = "<|tool_call_argument_begin|>";
-    let close = "<|tool_call_end|>";
-    let mut i = 0usize;
-    while i < text.len() {
-        let slice = &text[i..];
-        let Some(pos) = slice.find(open) else {
-            break;
-        };
-        let start = i + pos + open.len();
-        let rest = &text[start..];
-        let Some(end_rel) = rest.find(close) else {
-            break;
-        };
-        let body = rest[..end_rel].trim();
-        if let Ok(v) = serde_json::from_str::<Value>(body)
-            && let Some(command) = v.get("command").and_then(|x| x.as_str())
-            && !command.trim().is_empty()
-        {
-            out.push(ToolCall {
-                tool: "shell".to_string(),
-                command: command.to_string(),
-                args: Value::Object(serde_json::Map::new()),
-            });
-        }
-        i = start + end_rel + close.len();
     }
 }
 

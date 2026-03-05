@@ -14,6 +14,28 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeFunctionCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeLlmResponse {
+    pub content: String,
+    pub tool_calls: Vec<NativeFunctionCall>,
+    pub assistant_message: Value,
+}
+
+pub fn build_openai_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<Value> {
+    let mut messages = vec![json!({"role":"system","content":system_prompt})];
+    for m in history {
+        messages.push(json!({"role": m.role, "content": m.content}));
+    }
+    messages
+}
+
 pub async fn call_llm(cfg: &Config, system_prompt: &str, user_prompt: &str) -> Result<String> {
     let messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -50,10 +72,7 @@ async fn call_llm_with_history_impl(
         Some(WorkingStatus::start("waiting response"))
     };
     let api_key = resolve_api_key(cfg)?;
-    let mut messages = vec![json!({"role":"system","content":system_prompt})];
-    for m in history {
-        messages.push(json!({"role": m.role, "content": m.content}));
-    }
+    let messages = build_openai_messages(system_prompt, history);
     let body = json!({
         "model": cfg.model,
         "messages": messages,
@@ -100,6 +119,56 @@ async fn call_llm_with_history_impl(
         working.finish();
     }
     Ok(out.trim().to_string())
+}
+
+pub async fn call_llm_with_messages_native_tools(
+    cfg: &Config,
+    messages: &[Value],
+    tools: &[Value],
+) -> Result<NativeLlmResponse> {
+    let api_key = resolve_api_key(cfg)?;
+    let body = json!({
+        "model": cfg.model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "temperature": 0.2,
+        "stream": false
+    });
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(900))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let resp = client
+        .post(&cfg.base_url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("Request failed: {}", cfg.base_url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.context("Failed to read response body")?;
+        bail!("API error {}: {}", status, text);
+    }
+
+    let text = resp.text().await.context("Failed to read response body")?;
+    let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
+    let assistant_message = val
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .context("Cannot parse response message")?;
+
+    Ok(NativeLlmResponse {
+        content: extract_content_from_message(&assistant_message).unwrap_or_default(),
+        tool_calls: extract_native_tool_calls(&assistant_message),
+        assistant_message,
+    })
 }
 
 async fn parse_sse_response(mut resp: reqwest::Response, print_live: bool) -> Result<String> {
@@ -165,7 +234,14 @@ fn extract_delta_content(value: &Value) -> Option<String> {
 
 fn extract_content(value: &Value) -> Option<String> {
     let content = value.get("choices")?.get(0)?.get("message")?.get("content")?;
+    extract_content_value(content)
+}
 
+fn extract_content_from_message(message: &Value) -> Option<String> {
+    extract_content_value(message.get("content")?)
+}
+
+fn extract_content_value(content: &Value) -> Option<String> {
     match content {
         Value::String(s) => Some(s.clone()),
         Value::Array(items) => {
@@ -181,4 +257,42 @@ fn extract_content(value: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn extract_native_tool_calls(message: &Value) -> Vec<NativeFunctionCall> {
+    let Some(items) = message.get("tool_calls").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (idx, tc) in items.iter().enumerate() {
+        let name = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let id = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("call_{}", idx + 1));
+        let arguments = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                _ => v.to_string(),
+            })
+            .unwrap_or_else(|| "{}".to_string());
+        out.push(NativeFunctionCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    out
 }
