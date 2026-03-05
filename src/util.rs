@@ -7,6 +7,36 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+// ── color helpers ────────────────────────────────────────────────────────────
+
+pub fn colors_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none()
+}
+
+fn ansi(code: &str, text: &str) -> String {
+    if colors_enabled() {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
+    }
+}
+
+pub fn color_rust(text: &str) -> String   { ansi("38;5;208", text) } // Ferris orange
+pub fn color_blue(text: &str) -> String   { ansi("94", text) }        // bright blue
+pub fn color_green(text: &str) -> String  { ansi("32", text) }
+pub fn color_yellow(text: &str) -> String { ansi("33", text) }
+pub fn color_red(text: &str) -> String    { ansi("31", text) }
+pub fn color_cyan(text: &str) -> String   { ansi("36", text) }
+pub fn color_dim(text: &str) -> String    { ansi("2", text) }
+pub fn color_bold(text: &str) -> String   { ansi("1", text) }
+
+/// Kept for backward-compat (was the only color helper before).
+pub fn blue_label(text: &str) -> String {
+    color_blue(text)
+}
+
+// ── prompts / input ──────────────────────────────────────────────────────────
+
 pub fn ask(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush().context("Failed to flush stdout")?;
@@ -30,16 +60,55 @@ pub fn ask_or_eof(label: &str) -> Result<Option<String>> {
     Ok(Some(input.trim_end_matches(['\n', '\r']).to_string()))
 }
 
-pub fn blue_label(text: &str) -> String {
-    if std::env::var_os("NO_COLOR").is_some() {
-        return text.to_string();
-    }
-    format!("\x1b[94m{}\x1b[0m", text)
-}
-
 pub fn tagged_prompt(tag: &str, label: &str) -> String {
     format!("{} {}", blue_label(&format!("[{}]", tag)), label)
 }
+
+// ── startup banner ───────────────────────────────────────────────────────────
+
+const FERRIS: &str = r#"
+     _~^~^~_
+ \) /  o o  \ (/
+   '_   ~   _'
+   / '-----' \
+"#;
+
+pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
+    let sep = "─".repeat(44);
+
+    if colors_enabled() {
+        // Crab in Rust orange
+        for line in FERRIS.trim_matches('\n').lines() {
+            println!("{}", color_rust(line));
+        }
+        println!(
+            "  {}  {}",
+            color_bold(&color_rust("dongshan")),
+            color_dim("v0.2.0  ·  AI Coding Assistant")
+        );
+        println!("  {}", color_rust(&sep));
+        println!("  {}  {}", color_dim("session :"), color_cyan(session));
+        println!("  {}  {}", color_dim("model   :"), color_blue(model));
+        println!("  {}  {}", color_dim("mode    :"), color_yellow(exec_mode));
+        println!("  {}", color_rust(&sep));
+        println!(
+            "  {}",
+            color_dim("/help · /exit · /mode · /session · /model")
+        );
+    } else {
+        for line in FERRIS.trim_matches('\n').lines() {
+            println!("{}", line);
+        }
+        println!("  dongshan v0.2.0  ·  AI Coding Assistant");
+        println!("  {}", sep);
+        println!("  session : {}  model : {}  mode : {}", session, model, exec_mode);
+        println!("  {}", sep);
+        println!("  /help · /exit · /mode · /session · /model");
+    }
+    println!();
+}
+
+// ── misc string helpers ───────────────────────────────────────────────────────
 
 pub fn truncate_preview(text: &str, max_len: usize) -> String {
     truncate_with_suffix(text, max_len, "...")
@@ -92,6 +161,11 @@ pub fn prefix_chars(text: &str, max_chars: usize) -> String {
     text[..cut_at].to_string()
 }
 
+// ── working-status spinner ───────────────────────────────────────────────────
+
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
+
 pub struct WorkingStatus {
     label: String,
     start: Instant,
@@ -106,14 +180,26 @@ impl WorkingStatus {
         let start = Instant::now();
         let done = Arc::new(AtomicBool::new(false));
         let done_flag = Arc::clone(&done);
-        let label_for_thread = label.clone();
+        let label_clone = label.clone();
+        let use_color = colors_enabled();
 
         let handle = thread::spawn(move || {
+            let mut frame = 0usize;
             while !done_flag.load(Ordering::Relaxed) {
                 let secs = start.elapsed().as_secs();
-                print!("\r(working {} {}s)", label_for_thread, secs);
+                let spin = SPINNER[frame % SPINNER.len()];
+                if use_color {
+                    print!(
+                        "\r{} {}  ",
+                        format!("\x1b[36m{}\x1b[0m", spin),
+                        format!("\x1b[2m{} {}s\x1b[0m", label_clone, secs)
+                    );
+                } else {
+                    print!("\r{} {} {}s  ", spin, label_clone, secs);
+                }
                 let _ = io::stdout().flush();
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(SPINNER_INTERVAL);
+                frame += 1;
             }
         });
 
@@ -129,7 +215,15 @@ impl WorkingStatus {
     pub fn finish(mut self) {
         self.stop_thread();
         let secs = self.start.elapsed().as_secs();
-        print!("\r(done {} {}s)\n", self.label, secs);
+        if colors_enabled() {
+            print!(
+                "\r{} {}\n",
+                "\x1b[32m✓\x1b[0m",
+                format!("\x1b[2m{} {}s\x1b[0m", self.label, secs)
+            );
+        } else {
+            print!("\r✓ {} {}s\n", self.label, secs);
+        }
         let _ = io::stdout().flush();
         self.finished = true;
     }
@@ -146,7 +240,7 @@ impl Drop for WorkingStatus {
     fn drop(&mut self) {
         if !self.finished {
             self.stop_thread();
-            print!("\r");
+            print!("\r\x1b[K"); // clear the spinner line
             let _ = io::stdout().flush();
         }
     }

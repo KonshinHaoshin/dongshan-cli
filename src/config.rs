@@ -513,7 +513,7 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\n- fs_delete args: {path, recursive?}");
         prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
         prompt.push_str("\n- shell args: {command} (legacy fallback)");
-        prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs.read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
+        prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs_read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
         prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");
     }
     if cfg.allow_nsfw {

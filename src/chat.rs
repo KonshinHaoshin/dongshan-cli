@@ -25,7 +25,8 @@ use crate::llm::{
 };
 use crate::prompt_store::list_prompt_names;
 use crate::util::{
-    WorkingStatus, ask, ask_or_eof, prefix_chars, tagged_prompt, truncate_preview,
+    WorkingStatus, ask, ask_or_eof, color_blue, color_cyan, color_dim, color_green, color_red,
+    color_yellow, prefix_chars, print_startup_banner, tagged_prompt, truncate_preview,
     truncate_with_suffix,
 };
 const MAX_AUTO_TOOL_STEPS: usize = 3;
@@ -62,12 +63,10 @@ impl ChatExecutionMode {
 pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
     let mut active_session = resolve_session_name(session)?;
     let mut exec_mode = ChatExecutionMode::AgentAuto;
-    println!("== dongshan chat ({active_session}) ==");
-    println!("Type /help for slash commands. Type /exit to quit.");
-    println!("Execution mode: {}", exec_mode.as_str());
+    print_startup_banner(&active_session, &cfg.model, exec_mode.as_str());
     let mut history = load_session_or_default(&active_session)?;
     loop {
-        let Some(input) = ask_or_eof("you> ")? else {
+        let Some(input) = ask_or_eof(&color_green("you> "))? else {
             break;
         };
         if input.trim().eq_ignore_ascii_case("/exit") {
@@ -320,6 +319,29 @@ fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
     *history = compacted;
 }
 
+fn compact_native_messages(messages: &mut Vec<Value>, max_chars: usize) {
+    let total: usize = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+        .map(|s| s.len())
+        .sum();
+    if total <= max_chars {
+        return;
+    }
+    const CLIP_TO: usize = 400;
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(content) = msg.get_mut("content") {
+                if let Some(s) = content.as_str() {
+                    if s.len() > CLIP_TO {
+                        *content = json!(truncate_with_suffix(s, CLIP_TO, "...[truncated]"));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn summarize_history(messages: &[ChatMessage]) -> String {
     let mut lines = Vec::new();
     for m in messages.iter().rev().take(20).rev() {
@@ -538,25 +560,29 @@ async fn handle_chat_slash_command(
 
     match cmd {
         "/help" => {
-            println!("Slash commands:");
-            println!("/help");
-            println!("/exit");
-            println!("/new [name]");
-            println!("/clear");
-            println!("/session list");
-            println!("/session use <name>");
-            println!("/session rm <name>");
-            println!("/mode show");
-            println!("/mode chat|agent-auto|agent-force");
-            println!("/read <file> [question]");
-            println!("/askfile <file> <question>");
-            println!("/list [path]");
-            println!("/grep <pattern> [path]");
-            println!("/prompt show");
-            println!("/prompt list");
-            println!("/prompt use <name>");
-            println!("/model list");
-            println!("/model use <name>");
+            let c = |cmd: &str, desc: &str| {
+                println!("  {}  {}", color_cyan(cmd), color_dim(desc));
+            };
+            println!("{}", color_dim("─────────────────────────────────────────────"));
+            c("/help",                       "show this message");
+            c("/exit",                       "quit");
+            c("/new [name]",                 "start a new session");
+            c("/clear",                      "clear current session history");
+            c("/session list",               "list saved sessions");
+            c("/session use <name>",         "switch session");
+            c("/session rm <name>",          "delete session");
+            c("/mode show",                  "show current execution mode");
+            c("/mode chat|agent-auto|agent-force", "switch execution mode");
+            c("/read <file> [question]",     "read a file into context");
+            c("/askfile <file> <question>",  "ask about a file");
+            c("/list [path]",                "list files");
+            c("/grep <pattern> [path]",      "search files");
+            c("/prompt show",                "show active prompt");
+            c("/prompt list",                "list prompts");
+            c("/prompt use <name>",          "switch prompt");
+            c("/model list",                 "list available models");
+            c("/model use <name>",           "switch model");
+            println!("{}", color_dim("─────────────────────────────────────────────"));
         }
         "/new" => {
             let next = parts.next();
@@ -634,10 +660,10 @@ async fn handle_chat_slash_command(
         "/mode" => {
             let sub = parts.next().unwrap_or("show");
             if sub.eq_ignore_ascii_case("show") {
-                println!("Execution mode: {}", exec_mode.as_str());
+                println!("mode: {}", color_yellow(exec_mode.as_str()));
             } else if let Some(next_mode) = ChatExecutionMode::parse(sub) {
                 *exec_mode = next_mode;
-                println!("Execution mode switched to: {}", exec_mode.as_str());
+                println!("mode → {}", color_yellow(exec_mode.as_str()));
             } else {
                 println!("Usage: /mode show|chat|agent-auto|agent-force");
             }
@@ -1568,9 +1594,9 @@ async fn run_agent_turn_with_system_native(
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
     loop {
-        maybe_compact_history(history, cfg);
-        println!("(phase: reasoning step {})", steps + 1);
-        print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+        compact_native_messages(&mut messages, cfg.history_max_chars.max(2000));
+        println!("{}", color_dim(&format!("(phase: reasoning step {})", steps + 1)));
+        print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
         let resp = call_llm_with_messages_native_tools(cfg, &messages, &tools).await?;
         let answer = resp.content.trim().to_string();
         if !answer.is_empty() {
@@ -1641,8 +1667,8 @@ async fn run_agent_turn_with_system_legacy(
     let mut invalid_format_retries = 0usize;
     loop {
         maybe_compact_history(history, cfg);
-        println!("(phase: reasoning step {})", steps + 1);
-        print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+        println!("{}", color_dim(&format!("(phase: reasoning step {})", steps + 1)));
+        print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
         let answer = match call_llm_with_history_stream(cfg, system, history).await {
             Ok(v) => v,
             Err(err) => {
@@ -1784,8 +1810,8 @@ fn collect_tool_calls_from_fence(
 async fn run_chat_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
     let system = build_system_prompt(cfg, mode);
     maybe_compact_history(history, cfg);
-    println!("(phase: response)");
-    print!("assistant[{}]({})> ", cfg.active_prompt, cfg.model);
+    println!("{}", color_dim("(phase: response)"));
+    print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
     let answer = match call_llm_with_history_stream(cfg, &system, history).await {
         Ok(v) => v,
         Err(err) => {
@@ -1935,12 +1961,12 @@ fn looks_like_agent_task(input: &str) -> bool {
 }
 
 fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String, String)> {
-    println!("(phase: tool execution)");
-    println!("assistant> {}", exec_result.display_text);
-    println!("(phase: verification)");
+    println!("{}", color_dim("(phase: tool execution)"));
+    println!("{}", exec_result.display_text);
+    println!("{}", color_dim("(phase: verification)"));
     let verification = run_auto_verification()?;
     if !verification.trim().is_empty() {
-        println!("assistant> {}", verification);
+        println!("{} {}", color_dim("verify>"), verification);
     }
     let recovery_hint = if exec_result.had_failures {
         "\nSome commands failed. Prefer narrower retries: check file/path existence first, then rerun minimal commands.".to_string()
@@ -2495,15 +2521,15 @@ fn print_changed_files_delta(before: &BTreeSet<String>) -> Result<()> {
         return Ok(());
     }
 
-    println!("changed files:");
+    println!("{}", color_dim("changed files:"));
     for p in after.iter().filter(|p| !before.contains(*p)) {
-        println!("+ {}", p);
+        println!("{}", color_green(&format!("+ {}", p)));
     }
     for p in after.iter().filter(|p| before.contains(*p)) {
-        println!("~ {}", p);
+        println!("{}", color_yellow(&format!("~ {}", p)));
     }
     for p in before.iter().filter(|p| !after.contains(*p)) {
-        println!("- {}", p);
+        println!("{}", color_red(&format!("- {}", p)));
     }
     Ok(())
 }
