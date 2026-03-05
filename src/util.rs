@@ -21,14 +21,30 @@ fn ansi(code: &str, text: &str) -> String {
     }
 }
 
-pub fn color_rust(text: &str) -> String   { ansi("38;5;208", text) } // Ferris orange
-pub fn color_blue(text: &str) -> String   { ansi("94", text) }        // bright blue
-pub fn color_green(text: &str) -> String  { ansi("32", text) }
-pub fn color_yellow(text: &str) -> String { ansi("33", text) }
-pub fn color_red(text: &str) -> String    { ansi("31", text) }
-pub fn color_cyan(text: &str) -> String   { ansi("36", text) }
-pub fn color_dim(text: &str) -> String    { ansi("2", text) }
-pub fn color_bold(text: &str) -> String   { ansi("1", text) }
+pub fn color_rust(text: &str) -> String {
+    ansi("38;5;208", text)
+} // Ferris orange
+pub fn color_blue(text: &str) -> String {
+    ansi("94", text)
+} // bright blue
+pub fn color_green(text: &str) -> String {
+    ansi("32", text)
+}
+pub fn color_yellow(text: &str) -> String {
+    ansi("33", text)
+}
+pub fn color_red(text: &str) -> String {
+    ansi("31", text)
+}
+pub fn color_cyan(text: &str) -> String {
+    ansi("36", text)
+}
+pub fn color_dim(text: &str) -> String {
+    ansi("2", text)
+}
+pub fn color_bold(text: &str) -> String {
+    ansi("1", text)
+}
 
 /// Kept for backward-compat (was the only color helper before).
 pub fn blue_label(text: &str) -> String {
@@ -101,7 +117,10 @@ pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
         }
         println!("  dongshan v0.2.0  ·  AI Coding Assistant");
         println!("  {}", sep);
-        println!("  session : {}  model : {}  mode : {}", session, model, exec_mode);
+        println!(
+            "  session : {}  model : {}  mode : {}",
+            session, model, exec_mode
+        );
         println!("  {}", sep);
         println!("  /help · /exit · /mode · /session · /model");
     }

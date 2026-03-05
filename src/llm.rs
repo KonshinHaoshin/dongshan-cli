@@ -1,4 +1,4 @@
-﻿use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -233,7 +233,11 @@ fn extract_delta_content(value: &Value) -> Option<String> {
 }
 
 fn extract_content(value: &Value) -> Option<String> {
-    let content = value.get("choices")?.get(0)?.get("message")?.get("content")?;
+    let content = value
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?;
     extract_content_value(content)
 }
 

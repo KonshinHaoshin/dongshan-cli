@@ -1,6 +1,7 @@
-use std::fs;
 use std::collections::BTreeSet;
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,8 +13,8 @@ use serde_json::{Value, json};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
-    AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text, ensure_model_catalog,
-    save_config, set_active_model,
+    AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text,
+    ensure_model_catalog, save_config, set_active_model,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
@@ -84,7 +85,8 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut history,
                 &mut active_session,
                 &mut exec_mode,
-            ).await?;
+            )
+            .await?;
             save_session(&active_session, &history)?;
             print_changed_files_delta(&changed_before)?;
             continue;
@@ -147,7 +149,11 @@ async fn handle_natural_language_tool_command(
     }
 
     if let Some(name) = parse_prompt_use(input, &lower) {
-        if !list_prompt_names().unwrap_or_default().iter().any(|p| p == &name) {
+        if !list_prompt_names()
+            .unwrap_or_default()
+            .iter()
+            .any(|p| p == &name)
+        {
             println!("Prompt not found: {name}");
             return Ok(true);
         }
@@ -173,7 +179,12 @@ async fn handle_natural_language_tool_command(
             let mark = if *m == cfg.model { "*" } else { " " };
             println!("{mark} {m}");
         }
-        push_tool_result(history, input, "model.list", &format!("current={}", cfg.model));
+        push_tool_result(
+            history,
+            input,
+            "model.list",
+            &format!("current={}", cfg.model),
+        );
         return Ok(true);
     }
 
@@ -192,7 +203,10 @@ async fn handle_natural_language_tool_command(
     }
 
     if let Some(path) = extract_existing_file_path(input) {
-        if !is_read_request(input, &lower) && !is_list_request(input, &lower) && !is_grep_request(input, &lower) {
+        if !is_read_request(input, &lower)
+            && !is_list_request(input, &lower)
+            && !is_grep_request(input, &lower)
+        {
             submit_file_to_model(cfg, history, input, &path).await?;
             return Ok(true);
         }
@@ -205,7 +219,10 @@ async fn handle_natural_language_tool_command(
             } else {
                 let content = read_text_file(Path::new(&path))?;
                 push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
-                println!("Read {} (content hidden). Ask a follow-up question to analyze it.", path);
+                println!(
+                    "Read {} (content hidden). Ask a follow-up question to analyze it.",
+                    path
+                );
             }
             return Ok(true);
         }
@@ -294,7 +311,10 @@ fn clip_output(text: &str, max_len: usize) -> String {
 fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
     let max_messages = cfg.history_max_messages.max(4);
     let max_chars = cfg.history_max_chars.max(2000);
-    let total_chars = history.iter().map(|m| m.content.chars().count()).sum::<usize>();
+    let total_chars = history
+        .iter()
+        .map(|m| m.content.chars().count())
+        .sum::<usize>();
     if history.len() <= max_messages && total_chars <= max_chars {
         return;
     }
@@ -302,7 +322,9 @@ fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
         return;
     }
 
-    let tail_keep = (max_messages / 2).max(6).min(history.len().saturating_sub(1));
+    let tail_keep = (max_messages / 2)
+        .max(6)
+        .min(history.len().saturating_sub(1));
     let split_at = history.len().saturating_sub(tail_keep);
     if split_at == 0 {
         return;
@@ -345,7 +367,11 @@ fn compact_native_messages(messages: &mut Vec<Value>, max_chars: usize) {
 fn summarize_history(messages: &[ChatMessage]) -> String {
     let mut lines = Vec::new();
     for m in messages.iter().rev().take(20).rev() {
-        let role = if m.role == "user" { "user" } else { "assistant" };
+        let role = if m.role == "user" {
+            "user"
+        } else {
+            "assistant"
+        };
         let short = truncate_with_suffix(m.content.trim(), 220, "...");
         lines.push(format!("- {}: {}", role, short.replace('\n', " ")));
     }
@@ -378,14 +404,20 @@ fn is_list_request(input: &str, lower: &str) -> bool {
 
 fn is_grep_request(input: &str, lower: &str) -> bool {
     lower.contains("grep ")
-        || lower.contains("search ") || lower.contains("search for ") || lower.contains("find ") || lower.contains("find in ")
+        || lower.contains("search ")
+        || lower.contains("search for ")
+        || lower.contains("find ")
+        || lower.contains("find in ")
         || input.contains("\u{641c}\u{7d22}")
         || input.contains("\u{67e5}\u{627e}")
         || input.contains("\u{68c0}\u{7d22}")
 }
 
 fn is_prompt_list_request(input: &str, lower: &str) -> bool {
-    lower.contains("list prompt") || lower.contains("show prompts") || lower.contains("list presets") || lower.contains("show preset prompts")
+    lower.contains("list prompt")
+        || lower.contains("show prompts")
+        || lower.contains("list presets")
+        || lower.contains("show preset prompts")
         || input.contains("\u{63d0}\u{793a}\u{8bcd}\u{5217}\u{8868}")
         || input.contains("\u{5217}\u{51fa}prompt")
 }
@@ -563,26 +595,32 @@ async fn handle_chat_slash_command(
             let c = |cmd: &str, desc: &str| {
                 println!("  {}  {}", color_cyan(cmd), color_dim(desc));
             };
-            println!("{}", color_dim("─────────────────────────────────────────────"));
-            c("/help",                       "show this message");
-            c("/exit",                       "quit");
-            c("/new [name]",                 "start a new session");
-            c("/clear",                      "clear current session history");
-            c("/session list",               "list saved sessions");
-            c("/session use <name>",         "switch session");
-            c("/session rm <name>",          "delete session");
-            c("/mode show",                  "show current execution mode");
+            println!(
+                "{}",
+                color_dim("─────────────────────────────────────────────")
+            );
+            c("/help", "show this message");
+            c("/exit", "quit");
+            c("/new [name]", "start a new session");
+            c("/clear", "clear current session history");
+            c("/session list", "list saved sessions");
+            c("/session use <name>", "switch session");
+            c("/session rm <name>", "delete session");
+            c("/mode show", "show current execution mode");
             c("/mode chat|agent-auto|agent-force", "switch execution mode");
-            c("/read <file> [question]",     "read a file into context");
-            c("/askfile <file> <question>",  "ask about a file");
-            c("/list [path]",                "list files");
-            c("/grep <pattern> [path]",      "search files");
-            c("/prompt show",                "show active prompt");
-            c("/prompt list",                "list prompts");
-            c("/prompt use <name>",          "switch prompt");
-            c("/model list",                 "list available models");
-            c("/model use <name>",           "switch model");
-            println!("{}", color_dim("─────────────────────────────────────────────"));
+            c("/read <file> [question]", "read a file into context");
+            c("/askfile <file> <question>", "ask about a file");
+            c("/list [path]", "list files");
+            c("/grep <pattern> [path]", "search files");
+            c("/prompt show", "show active prompt");
+            c("/prompt list", "list prompts");
+            c("/prompt use <name>", "switch prompt");
+            c("/model list", "list available models");
+            c("/model use <name>", "switch model");
+            println!(
+                "{}",
+                color_dim("─────────────────────────────────────────────")
+            );
         }
         "/new" => {
             let next = parts.next();
@@ -677,7 +715,10 @@ async fn handle_chat_slash_command(
             if question.trim().is_empty() {
                 let content = read_text_file(Path::new(file))?;
                 push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
-                println!("Read {} (content hidden). Ask a follow-up question to analyze it.", file);
+                println!(
+                    "Read {} (content hidden). Ask a follow-up question to analyze it.",
+                    file
+                );
             } else {
                 submit_file_to_model(cfg, history, &question, file).await?;
             }
@@ -726,7 +767,11 @@ async fn handle_chat_slash_command(
                     println!("Active: {}", cfg.active_prompt);
                     for name in list_prompt_names().unwrap_or_default() {
                         if name == cfg.active_prompt {
-                            println!("- {}: {}", name, truncate_preview(&current_prompt_text(cfg), 90));
+                            println!(
+                                "- {}: {}",
+                                name,
+                                truncate_preview(&current_prompt_text(cfg), 90)
+                            );
                         } else {
                             println!("- {}: (stored)", name);
                         }
@@ -737,7 +782,11 @@ async fn handle_chat_slash_command(
                         println!("Usage: /prompt use <name>");
                         return Ok(());
                     };
-                    if !list_prompt_names().unwrap_or_default().iter().any(|p| p == name) {
+                    if !list_prompt_names()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|p| p == name)
+                    {
                         println!("Prompt not found: {name}");
                         return Ok(());
                     }
@@ -908,7 +957,7 @@ fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<Ex
             continue;
         }
 
-        let exec = execute_tool_call_by_name(cfg, &call);
+        let exec = execute_tool_call_with_progress(cfg, &call);
         let before_set = current_changed_file_set().unwrap_or_default();
 
         match exec {
@@ -1109,7 +1158,7 @@ fn execute_native_function_calls(
 
     for (call_id, call) in parsed {
         let before_set = current_changed_file_set().unwrap_or_default();
-        let exec = execute_tool_call_by_name(cfg, &call);
+        let exec = execute_tool_call_with_progress(cfg, &call);
 
         match exec {
             Ok(out) => {
@@ -1192,6 +1241,44 @@ fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String
     }
 }
 
+fn tool_progress_label(call: &ToolCall) -> Option<String> {
+    let tool = call.tool.trim().to_ascii_lowercase();
+    match tool.as_str() {
+        "fs.read_file" | "fs_read_file" => {
+            let p = tool_arg_string(call, &["path", "file"])?;
+            Some(format!("reading {}", p))
+        }
+        "fs.list_files" | "fs_list_files" => {
+            let p = tool_arg_string(call, &["path"]).unwrap_or_else(|| ".".to_string());
+            Some(format!("listing {}", p))
+        }
+        "fs.grep" | "fs_grep" => {
+            let pattern = tool_arg_string(call, &["pattern", "query"])?;
+            let p = tool_arg_string(call, &["path"]).unwrap_or_else(|| ".".to_string());
+            Some(format!("searching '{}' in {}", pattern, p))
+        }
+        _ => None,
+    }
+}
+
+fn execute_tool_call_with_progress(cfg: &mut Config, call: &ToolCall) -> Result<String> {
+    let progress = tool_progress_label(call);
+    let mut clear_width = 0usize;
+    if let Some(label) = &progress {
+        let line = format!("{} {}", color_dim("tool>"), label);
+        clear_width = line.chars().count();
+        print!("\r{}", line);
+        let _ = io::stdout().flush();
+    }
+    let res = execute_tool_call_by_name(cfg, call);
+    if clear_width > 0 {
+        let width = clear_width.min(200);
+        print!("\r{}\r", " ".repeat(width));
+        let _ = io::stdout().flush();
+    }
+    res
+}
+
 fn execute_shell_tool_call(cfg: &mut Config, call: &ToolCall) -> Result<String> {
     let cmd_owned = if !call.command.trim().is_empty() {
         call.command.trim().to_string()
@@ -1222,7 +1309,11 @@ fn execute_shell_tool_call(cfg: &mut Config, call: &ToolCall) -> Result<String> 
             return Ok("User stopped command execution.".to_string());
         }
         if choice == "a" {
-            if !cfg.auto_exec_trusted.iter().any(|x| x.eq_ignore_ascii_case(&prefix)) {
+            if !cfg
+                .auto_exec_trusted
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(&prefix))
+            {
                 cfg.auto_exec_trusted.push(prefix.clone());
                 let _ = save_config(cfg);
             }
@@ -1235,34 +1326,48 @@ fn execute_shell_tool_call(cfg: &mut Config, call: &ToolCall) -> Result<String> 
 }
 
 fn execute_native_fs_read(call: &ToolCall) -> Result<String> {
-    let raw = tool_arg_string(call, &["path", "file"]).ok_or_else(|| anyhow::anyhow!("fs.read_file requires args.path"))?;
+    let raw = tool_arg_string(call, &["path", "file"])
+        .ok_or_else(|| anyhow::anyhow!("fs.read_file requires args.path"))?;
     let path = resolve_native_path(&raw)?;
     let text = read_text_file(&path)?;
-    Ok(format!("Read: {}\n{}", path.display(), clip_output(&text, 12000)))
+    Ok(format!(
+        "Read: {}\n{}",
+        path.display(),
+        clip_output(&text, 12000)
+    ))
 }
 
 fn execute_native_fs_create(call: &ToolCall) -> Result<String> {
-    let raw = tool_arg_string(call, &["path", "file"]).ok_or_else(|| anyhow::anyhow!("fs.create_file requires args.path"))?;
-    let content = tool_arg_string(call, &["content"]).ok_or_else(|| anyhow::anyhow!("fs.create_file requires args.content"))?;
+    let raw = tool_arg_string(call, &["path", "file"])
+        .ok_or_else(|| anyhow::anyhow!("fs.create_file requires args.path"))?;
+    let content = tool_arg_string(call, &["content"])
+        .ok_or_else(|| anyhow::anyhow!("fs.create_file requires args.content"))?;
     let overwrite = tool_arg_bool(call, &["overwrite"]).unwrap_or(true);
     let path = resolve_native_path(&raw)?;
     if path.exists() && !overwrite {
-        bail!("target already exists and overwrite=false: {}", path.display());
+        bail!(
+            "target already exists and overwrite=false: {}",
+            path.display()
+        );
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
     }
     fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(format!("Created file: {}", path.display()))
 }
 
 fn execute_native_fs_edit(call: &ToolCall) -> Result<String> {
-    let raw = tool_arg_string(call, &["path", "file"]).ok_or_else(|| anyhow::anyhow!("fs.edit_file requires args.path"))?;
+    let raw = tool_arg_string(call, &["path", "file"])
+        .ok_or_else(|| anyhow::anyhow!("fs.edit_file requires args.path"))?;
     let old_str = tool_arg_string(call, &["old_str", "old"]).unwrap_or_default();
-    let new_str = tool_arg_string(call, &["new_str", "new"]).ok_or_else(|| anyhow::anyhow!("fs.edit_file requires args.new_str"))?;
+    let new_str = tool_arg_string(call, &["new_str", "new"])
+        .ok_or_else(|| anyhow::anyhow!("fs.edit_file requires args.new_str"))?;
     let replace_all = tool_arg_bool(call, &["replace_all"]).unwrap_or(false);
     let path = resolve_native_path(&raw)?;
-    let mut text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut text =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     if old_str.is_empty() {
         text = new_str;
@@ -1285,27 +1390,43 @@ fn execute_native_fs_list(call: &ToolCall) -> Result<String> {
     let raw = tool_arg_string(call, &["path"]).unwrap_or_else(|| ".".to_string());
     let path = resolve_native_path(&raw)?;
     let out = list_files_output(&path)?;
-    Ok(format!("List: {}\n{}", path.display(), clip_output(&out, 12000)))
+    Ok(format!(
+        "List: {}\n{}",
+        path.display(),
+        clip_output(&out, 12000)
+    ))
 }
 
 fn execute_native_fs_grep(call: &ToolCall) -> Result<String> {
-    let pattern = tool_arg_string(call, &["pattern", "query"]).ok_or_else(|| anyhow::anyhow!("fs.grep requires args.pattern"))?;
+    let pattern = tool_arg_string(call, &["pattern", "query"])
+        .ok_or_else(|| anyhow::anyhow!("fs.grep requires args.pattern"))?;
     let raw = tool_arg_string(call, &["path"]).unwrap_or_else(|| ".".to_string());
     let path = resolve_native_path(&raw)?;
     let out = grep_output(&path, &pattern)?;
     if out.trim().is_empty() {
-        return Ok(format!("Grep: {} in {}\nNo matches found.", pattern, path.display()));
+        return Ok(format!(
+            "Grep: {} in {}\nNo matches found.",
+            pattern,
+            path.display()
+        ));
     }
-    Ok(format!("Grep: {} in {}\n{}", pattern, path.display(), clip_output(&out, 12000)))
+    Ok(format!(
+        "Grep: {} in {}\n{}",
+        pattern,
+        path.display(),
+        clip_output(&out, 12000)
+    ))
 }
 
-
 fn execute_native_fs_apply_patch(call: &ToolCall) -> Result<String> {
-    let raw = tool_arg_string(call, &["path", "file"]).ok_or_else(|| anyhow::anyhow!("fs.apply_patch requires args.path"))?;
+    let raw = tool_arg_string(call, &["path", "file"])
+        .ok_or_else(|| anyhow::anyhow!("fs.apply_patch requires args.path"))?;
     let path = resolve_native_path(&raw)?;
-    let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
-    let edits = tool_arg_array(call, &["edits", "patches"]).ok_or_else(|| anyhow::anyhow!("fs.apply_patch requires args.edits[]"))?;
+    let edits = tool_arg_array(call, &["edits", "patches"])
+        .ok_or_else(|| anyhow::anyhow!("fs.apply_patch requires args.edits[]"))?;
     if edits.is_empty() {
         bail!("fs.apply_patch requires at least one edit");
     }
@@ -1329,7 +1450,10 @@ fn execute_native_fs_apply_patch(call: &ToolCall) -> Result<String> {
             .or_else(|| obj.get("new_str"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let replace_all = obj.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let replace_all = obj
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if old_s.is_empty() {
             misses.push(format!("#{} old/old_str is empty", idx + 1));
             continue;
@@ -1400,19 +1524,24 @@ fn execute_native_fs_apply_patch(call: &ToolCall) -> Result<String> {
 }
 
 fn execute_native_fs_move(call: &ToolCall) -> Result<String> {
-    let from_raw = tool_arg_string(call, &["from", "src", "source"]).ok_or_else(|| anyhow::anyhow!("fs.move requires args.from"))?;
-    let to_raw = tool_arg_string(call, &["to", "dst", "target"]).ok_or_else(|| anyhow::anyhow!("fs.move requires args.to"))?;
+    let from_raw = tool_arg_string(call, &["from", "src", "source"])
+        .ok_or_else(|| anyhow::anyhow!("fs.move requires args.from"))?;
+    let to_raw = tool_arg_string(call, &["to", "dst", "target"])
+        .ok_or_else(|| anyhow::anyhow!("fs.move requires args.to"))?;
     let from = resolve_native_path(&from_raw)?;
     let to = resolve_native_path(&to_raw)?;
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir {}", parent.display()))?;
     }
-    fs::rename(&from, &to).with_context(|| format!("Failed to move {} -> {}", from.display(), to.display()))?;
+    fs::rename(&from, &to)
+        .with_context(|| format!("Failed to move {} -> {}", from.display(), to.display()))?;
     Ok(format!("Moved: {} -> {}", from.display(), to.display()))
 }
 
 fn execute_native_fs_delete(call: &ToolCall) -> Result<String> {
-    let raw = tool_arg_string(call, &["path", "file", "target"]).ok_or_else(|| anyhow::anyhow!("fs.delete requires args.path"))?;
+    let raw = tool_arg_string(call, &["path", "file", "target"])
+        .ok_or_else(|| anyhow::anyhow!("fs.delete requires args.path"))?;
     let recursive = tool_arg_bool(call, &["recursive", "r"]).unwrap_or(false);
     let p = resolve_native_path(&raw)?;
     if !p.exists() {
@@ -1420,9 +1549,12 @@ fn execute_native_fs_delete(call: &ToolCall) -> Result<String> {
     }
     if p.is_dir() {
         if recursive {
-            fs::remove_dir_all(&p).with_context(|| format!("Failed to remove dir {}", p.display()))?;
+            fs::remove_dir_all(&p)
+                .with_context(|| format!("Failed to remove dir {}", p.display()))?;
         } else {
-            fs::remove_dir(&p).with_context(|| format!("Failed to remove dir {} (set recursive=true)", p.display()))?;
+            fs::remove_dir(&p).with_context(|| {
+                format!("Failed to remove dir {} (set recursive=true)", p.display())
+            })?;
         }
     } else {
         fs::remove_file(&p).with_context(|| format!("Failed to remove file {}", p.display()))?;
@@ -1431,7 +1563,15 @@ fn execute_native_fs_delete(call: &ToolCall) -> Result<String> {
 }
 
 fn execute_structured_run_command(cfg: &mut Config, call: &ToolCall) -> Result<String> {
-    let cmd = tool_arg_string(call, &["command", "cmd"]).or_else(|| if call.command.trim().is_empty() { None } else { Some(call.command.clone()) }).ok_or_else(|| anyhow::anyhow!("run_command requires args.command"))?;
+    let cmd = tool_arg_string(call, &["command", "cmd"])
+        .or_else(|| {
+            if call.command.trim().is_empty() {
+                None
+            } else {
+                Some(call.command.clone())
+            }
+        })
+        .ok_or_else(|| anyhow::anyhow!("run_command requires args.command"))?;
     let shell_call = ToolCall {
         tool: "shell".to_string(),
         command: cmd,
@@ -1448,7 +1588,8 @@ fn resolve_native_path(raw: &str) -> Result<PathBuf> {
     };
 
     let normalized = if base.exists() {
-        base.canonicalize().with_context(|| format!("Failed to resolve path {}", base.display()))?
+        base.canonicalize()
+            .with_context(|| format!("Failed to resolve path {}", base.display()))?
     } else if let Some(parent) = base.parent() {
         let p = parent
             .canonicalize()
@@ -1462,7 +1603,9 @@ fn resolve_native_path(raw: &str) -> Result<PathBuf> {
         base.clone()
     };
 
-    let cwd_norm = cwd.canonicalize().with_context(|| format!("Failed to resolve cwd {}", cwd.display()))?;
+    let cwd_norm = cwd
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve cwd {}", cwd.display()))?;
     if !normalized.starts_with(&cwd_norm) {
         bail!("path outside workspace is not allowed: {}", raw);
     }
@@ -1518,7 +1661,9 @@ fn precheck_command(cmd: &str) -> Option<String> {
     let first = tokens[0].to_ascii_lowercase();
     let lower = cmd.to_ascii_lowercase();
 
-    if (lower.contains("base64") || lower.contains("frombase64string") || lower.contains("[convert]::frombase64string"))
+    if (lower.contains("base64")
+        || lower.contains("frombase64string")
+        || lower.contains("[convert]::frombase64string"))
         && cmd.len() > 700
     {
         return Some("base64 payload too long; use small script file workflow instead".to_string());
@@ -1562,7 +1707,11 @@ fn looks_like_command_failure(output: &str) -> bool {
         || s.contains("is not recognized")
 }
 
-async fn run_agent_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &str) -> Result<()> {
+async fn run_agent_turn(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    mode: &str,
+) -> Result<()> {
     let system = build_system_prompt(cfg, mode);
     run_agent_turn_with_system(cfg, history, &system).await
 }
@@ -1595,8 +1744,17 @@ async fn run_agent_turn_with_system_native(
     let mut unsafe_retries = 0usize;
     loop {
         compact_native_messages(&mut messages, cfg.history_max_chars.max(2000));
-        println!("{}", color_dim(&format!("(phase: reasoning step {})", steps + 1)));
-        print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
+        println!(
+            "{}",
+            color_dim(&format!("(phase: reasoning step {})", steps + 1))
+        );
+        print!(
+            "{}",
+            color_blue(&format!(
+                "assistant[{}]({})> ",
+                cfg.active_prompt, cfg.model
+            ))
+        );
         let resp = call_llm_with_messages_native_tools(cfg, &messages, &tools).await?;
         let answer = resp.content.trim().to_string();
         if !answer.is_empty() {
@@ -1667,8 +1825,17 @@ async fn run_agent_turn_with_system_legacy(
     let mut invalid_format_retries = 0usize;
     loop {
         maybe_compact_history(history, cfg);
-        println!("{}", color_dim(&format!("(phase: reasoning step {})", steps + 1)));
-        print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
+        println!(
+            "{}",
+            color_dim(&format!("(phase: reasoning step {})", steps + 1))
+        );
+        print!(
+            "{}",
+            color_blue(&format!(
+                "assistant[{}]({})> ",
+                cfg.active_prompt, cfg.model
+            ))
+        );
         let answer = match call_llm_with_history_stream(cfg, system, history).await {
             Ok(v) => v,
             Err(err) => {
@@ -1732,7 +1899,9 @@ async fn run_agent_turn_with_system_legacy(
             continue;
         }
 
-        println!("assistant> Detected tool calls, but skipped because commands are unsafe or unsupported.\n");
+        println!(
+            "assistant> Detected tool calls, but skipped because commands are unsafe or unsupported.\n"
+        );
         return Ok(());
     }
 }
@@ -1811,7 +1980,13 @@ async fn run_chat_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &
     let system = build_system_prompt(cfg, mode);
     maybe_compact_history(history, cfg);
     println!("{}", color_dim("(phase: response)"));
-    print!("{}", color_blue(&format!("assistant[{}]({})> ", cfg.active_prompt, cfg.model)));
+    print!(
+        "{}",
+        color_blue(&format!(
+            "assistant[{}]({})> ",
+            cfg.active_prompt, cfg.model
+        ))
+    );
     let answer = match call_llm_with_history_stream(cfg, &system, history).await {
         Ok(v) => v,
         Err(err) => {
@@ -1866,13 +2041,8 @@ async fn classify_mode_with_llm(
     history: &[ChatMessage],
     input: &str,
 ) -> Result<Option<bool>> {
-    let mut router_history: Vec<ChatMessage> = history
-        .iter()
-        .rev()
-        .take(4)
-        .rev()
-        .cloned()
-        .collect();
+    let mut router_history: Vec<ChatMessage> =
+        history.iter().rev().take(4).rev().cloned().collect();
     router_history.push(ChatMessage {
         role: "user".to_string(),
         content: format!(
@@ -1964,16 +2134,13 @@ fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String,
     println!("{}", color_dim("(phase: tool execution)"));
     let tool_calls = exec_result.display_text.matches("tool[").count();
     if exec_result.had_failures {
-        println!(
-            "{} tool calls executed with failures (details hidden)",
-            tool_calls
-        );
+        println!("{} tool calls executed with failures.", tool_calls);
     } else {
-        println!("{} tool calls executed (details hidden)", tool_calls);
+        println!("{} tool calls executed.", tool_calls);
     }
     println!("{}", color_dim("(phase: verification)"));
     let verification = run_auto_verification()?;
-    if !verification.trim().is_empty() {
+    if !verification.trim().is_empty() && !verification.starts_with("verification: skipped") {
         println!("{} {}", color_dim("verify>"), verification);
     }
     let recovery_hint = if exec_result.had_failures {
@@ -2110,7 +2277,12 @@ fn collect_tool_calls_from_value(value: &Value, out: &mut Vec<ToolCall>) {
             } else {
                 let mut m = serde_json::Map::new();
                 for (k, v) in map {
-                    if k == "tool" || k == "type" || k == "command" || k == "cmd" || k == "tool_calls" {
+                    if k == "tool"
+                        || k == "type"
+                        || k == "command"
+                        || k == "cmd"
+                        || k == "tool_calls"
+                    {
                         continue;
                     }
                     m.insert(k.clone(), v.clone());
@@ -2120,7 +2292,11 @@ fn collect_tool_calls_from_value(value: &Value, out: &mut Vec<ToolCall>) {
 
             let has_args = matches!(&args, Value::Object(m) if !m.is_empty());
             if !tool.trim().is_empty() && (!command.trim().is_empty() || has_args) {
-                out.push(ToolCall { tool, command, args });
+                out.push(ToolCall {
+                    tool,
+                    command,
+                    args,
+                });
             }
         }
         _ => {}
@@ -2343,7 +2519,9 @@ fn limit_lines(s: &str, n: usize) -> String {
 }
 
 fn session_path(session: &str) -> Result<std::path::PathBuf> {
-    Ok(config_dir()?.join("sessions").join(format!("{session}.json")))
+    Ok(config_dir()?
+        .join("sessions")
+        .join(format!("{session}.json")))
 }
 
 fn sessions_dir() -> Result<PathBuf> {
@@ -2392,7 +2570,11 @@ fn sanitize_session_name(name: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() { "session".to_string() } else { s }
+    if s.is_empty() {
+        "session".to_string()
+    } else {
+        s
+    }
 }
 
 fn load_session_or_default(session: &str) -> Result<Vec<ChatMessage>> {
@@ -2466,11 +2648,10 @@ fn list_saved_sessions() -> Result<Vec<String>> {
     }
 
     let mut names = Vec::new();
-    for entry in
-        fs::read_dir(&dir).with_context(|| format!("Failed to read session dir {}", dir.display()))?
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("Failed to read session dir {}", dir.display()))?
     {
-        let entry =
-            entry.with_context(|| format!("Failed to read entry in {}", dir.display()))?;
+        let entry = entry.with_context(|| format!("Failed to read entry in {}", dir.display()))?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -2494,9 +2675,7 @@ fn remove_session_file(session: &str) -> Result<bool> {
 }
 
 fn list_workspace_changed_files() -> Result<Vec<String>> {
-    let out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output();
+    let out = Command::new("git").args(["status", "--porcelain"]).output();
     let Ok(out) = out else {
         return Ok(Vec::new());
     };
@@ -2575,13 +2754,6 @@ fn guessed_changed_files_for_call(call: &ToolCall) -> Vec<String> {
     out.into_iter().collect()
 }
 
-
-
-
-
-
-
-
 fn decode_command_output(bytes: &[u8]) -> String {
     if let Ok(utf8) = std::str::from_utf8(bytes) {
         return fix_mojibake_if_needed(utf8);
@@ -2637,11 +2809,3 @@ fn looks_more_readable_chinese(candidate: &str, original: &str) -> bool {
     }
     score(candidate) > score(original)
 }
-
-
-
-
-
-
-
-

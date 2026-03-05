@@ -18,6 +18,17 @@ pub enum ProviderPreset {
     Nvidia,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelApiProvider {
+    Openai,
+    At,
+}
+
+fn default_model_provider() -> ModelApiProvider {
+    ModelApiProvider::Openai
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoExecMode {
@@ -28,6 +39,8 @@ pub enum AutoExecMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
+    #[serde(default = "default_model_provider")]
+    pub provider: ModelApiProvider,
     pub base_url: String,
     pub api_key_env: String,
     #[serde(default)]
@@ -78,6 +91,7 @@ impl Default for Config {
         model_profiles.insert(
             model.clone(),
             ModelProfile {
+                provider: ModelApiProvider::Openai,
                 base_url: base_url.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
@@ -193,6 +207,7 @@ pub fn apply_preset(cfg: &mut Config, provider: ProviderPreset) {
     cfg.model_profiles.insert(
         model.clone(),
         ModelProfile {
+            provider: ModelApiProvider::Openai,
             base_url,
             api_key_env,
             api_key: cfg.api_key.clone(),
@@ -279,6 +294,11 @@ pub fn save_config(cfg: &Config) -> Result<()> {
 
 pub fn ensure_model_catalog(cfg: &mut Config) {
     let fallback = ModelProfile {
+        provider: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.provider)
+            .unwrap_or(ModelApiProvider::Openai),
         base_url: cfg.base_url.clone(),
         api_key_env: cfg.api_key_env.clone(),
         api_key: cfg.api_key.clone(),
@@ -339,6 +359,11 @@ pub fn update_active_model_profile(cfg: &mut Config) {
     cfg.model_profiles.insert(
         cfg.model.clone(),
         ModelProfile {
+            provider: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.provider)
+                .unwrap_or(ModelApiProvider::Openai),
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -370,6 +395,7 @@ pub fn add_model_with_active_profile(cfg: &mut Config, model: &str) {
         .get(&cfg.model)
         .cloned()
         .unwrap_or(ModelProfile {
+            provider: ModelApiProvider::Openai,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -399,6 +425,7 @@ pub fn upsert_model_profile(
     base_url: Option<String>,
     api_key_env: Option<String>,
     api_key: Option<String>,
+    provider: Option<ModelApiProvider>,
 ) {
     let name = model.trim();
     if name.is_empty() {
@@ -411,11 +438,15 @@ pub fn upsert_model_profile(
         .get(name)
         .cloned()
         .unwrap_or(ModelProfile {
+            provider: ModelApiProvider::Openai,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
         });
 
+    if let Some(v) = provider {
+        p.provider = v;
+    }
     if let Some(v) = base_url
         && !v.trim().is_empty()
     {
@@ -506,7 +537,9 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\n- fs_read_file args: {path}");
         prompt.push_str("\n- fs_create_file args: {path, content, overwrite?}");
         prompt.push_str("\n- fs_edit_file args: {path, old_str, new_str, replace_all?}");
-        prompt.push_str("\n- fs_apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}");
+        prompt.push_str(
+            "\n- fs_apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}",
+        );
         prompt.push_str("\n- fs_list_files args: {path?}");
         prompt.push_str("\n- fs_grep args: {pattern, path?}");
         prompt.push_str("\n- fs_move args: {from, to}");
@@ -523,4 +556,3 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
     }
     prompt
 }
-

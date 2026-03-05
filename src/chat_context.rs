@@ -167,5 +167,8 @@ fn is_ignored(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
-    matches!(name, ".git" | "node_modules" | "target" | ".idea" | ".vscode")
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | ".idea" | ".vscode"
+    )
 }

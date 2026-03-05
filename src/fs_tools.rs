@@ -8,7 +8,8 @@ pub fn read_text_file(path: &Path) -> Result<String> {
     if !path.exists() {
         bail!("File does not exist: {}", path.display());
     }
-    let text = fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     Ok(text)
 }
 
@@ -112,7 +113,12 @@ fn grep_recursive_output(root: &Path, pattern: &str) -> Result<String> {
         };
         for (idx, line) in content.lines().enumerate() {
             if line.to_lowercase().contains(&pattern_lower) {
-                out.push_str(&format!("{}:{}:{}\n", entry.display(), idx + 1, line.trim()));
+                out.push_str(&format!(
+                    "{}:{}:{}\n",
+                    entry.display(),
+                    idx + 1,
+                    line.trim()
+                ));
             }
         }
     }
@@ -147,5 +153,8 @@ fn is_ignored_dir(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    matches!(name, ".git" | "node_modules" | "target" | ".idea" | ".vscode")
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | ".idea" | ".vscode"
+    )
 }

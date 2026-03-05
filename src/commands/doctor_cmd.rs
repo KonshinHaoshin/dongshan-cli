@@ -16,8 +16,8 @@ pub async fn run_doctor() -> Result<()> {
     println!("Profile base_url: {}", profile.base_url);
     println!("Profile api_key_env: {}", profile.api_key_env);
 
-    let _url =
-        reqwest::Url::parse(&profile.base_url).map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?;
+    let _url = reqwest::Url::parse(&profile.base_url)
+        .map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?;
     println!("[ok] base_url is valid URL");
 
     let api_key = resolve_api_key(&cfg)?;

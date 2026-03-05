@@ -116,8 +116,12 @@ fn build_change_report(original: &str, edited: &str) -> ChangeReport {
             let last_new_end = last.new_start + last.new_len;
             let chunk_old_end = chunk.old_start + chunk.old_len;
             let chunk_new_end = chunk.new_start + chunk.new_len;
-            last.old_len = chunk_old_end.saturating_sub(last.old_start).max(last_old_end - last.old_start);
-            last.new_len = chunk_new_end.saturating_sub(last.new_start).max(last_new_end - last.new_start);
+            last.old_len = chunk_old_end
+                .saturating_sub(last.old_start)
+                .max(last_old_end - last.old_start);
+            last.new_len = chunk_new_end
+                .saturating_sub(last.new_start)
+                .max(last_new_end - last.new_start);
             continue;
         }
         merged.push(chunk);

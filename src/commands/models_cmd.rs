@@ -21,7 +21,11 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::Use { name } => {
             if !cfg.model_catalog.iter().any(|m| m == &name) {
-                bail!("Model not in catalog: {}. Use `dongshan models add {}` first.", name, name);
+                bail!(
+                    "Model not in catalog: {}. Use `dongshan models add {}` first.",
+                    name,
+                    name
+                );
             }
             set_active_model(&mut cfg, &name);
             save_config(&cfg)?;
@@ -29,13 +33,18 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::Add {
             name,
+            provider,
             base_url,
             api_key_env,
             api_key,
         } => {
             add_model_with_active_profile(&mut cfg, &name);
-            if base_url.is_some() || api_key_env.is_some() || api_key.is_some() {
-                upsert_model_profile(&mut cfg, &name, base_url, api_key_env, api_key);
+            if provider.is_some()
+                || base_url.is_some()
+                || api_key_env.is_some()
+                || api_key.is_some()
+            {
+                upsert_model_profile(&mut cfg, &name, base_url, api_key_env, api_key, provider);
             }
             save_config(&cfg)?;
             println!("Model added: {}", name);
@@ -56,6 +65,7 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
                 bail!("Model profile not found: {}", target);
             };
             println!("Model: {}", target);
+            println!("  provider: {:?}", p.provider);
             println!("  base_url: {}", p.base_url);
             println!("  api_key_env: {}", p.api_key_env);
             println!(
@@ -73,14 +83,21 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
         }
         ModelsCommand::SetProfile {
             name,
+            provider,
             base_url,
             api_key_env,
             api_key,
         } => {
-            if base_url.is_none() && api_key_env.is_none() && api_key.is_none() {
-                bail!("Nothing to set. Provide at least one of --base-url/--api-key-env/--api-key.");
+            if provider.is_none()
+                && base_url.is_none()
+                && api_key_env.is_none()
+                && api_key.is_none()
+            {
+                bail!(
+                    "Nothing to set. Provide at least one of --provider/--base-url/--api-key-env/--api-key."
+                );
             }
-            upsert_model_profile(&mut cfg, &name, base_url, api_key_env, api_key);
+            upsert_model_profile(&mut cfg, &name, base_url, api_key_env, api_key, provider);
             save_config(&cfg)?;
             println!("Profile updated for model: {}", name);
         }

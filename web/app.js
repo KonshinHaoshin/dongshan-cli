@@ -84,6 +84,12 @@ const ProviderPage = {
       <div class="grid">
         <div class="card">
           <h3>Provider / API</h3>
+          <label>Provider
+            <select v-model="form.provider">
+              <option value="openai">openai</option>
+              <option value="at">at</option>
+            </select>
+          </label>
           <label>Base URL <input v-model="form.base_url" /></label>
           <div class="row2">
             <label>Model <input v-model="form.model" /></label>
@@ -101,10 +107,19 @@ const ProviderPage = {
 };
 
 const ModelsPage = {
-  props: ["state", "selectedModel", "newModelName", "newModelBaseUrl", "newModelApiKeyEnv", "newModelApiKey"],
+  props: [
+    "state",
+    "selectedModel",
+    "newModelName",
+    "newModelProvider",
+    "newModelBaseUrl",
+    "newModelApiKeyEnv",
+    "newModelApiKey",
+  ],
   emits: [
     "update:selectedModel",
     "update:newModelName",
+    "update:newModelProvider",
     "update:newModelBaseUrl",
     "update:newModelApiKeyEnv",
     "update:newModelApiKey",
@@ -122,8 +137,17 @@ const ModelsPage = {
             <label>Add model <input :value="newModelName" @input="$emit('update:newModelName', $event.target.value)" placeholder="grok-code-fast-1" /></label>
           </div>
           <div class="row2">
+            <label>Provider
+              <select :value="newModelProvider" @change="$emit('update:newModelProvider', $event.target.value)">
+                <option value="openai">openai</option>
+                <option value="at">at</option>
+              </select>
+            </label>
             <label>Custom base_url (optional) <input :value="newModelBaseUrl" @input="$emit('update:newModelBaseUrl', $event.target.value)" placeholder="https://api.openai.com/v1/chat/completions" /></label>
+          </div>
+          <div class="row2">
             <label>Custom api_key_env (optional) <input :value="newModelApiKeyEnv" @input="$emit('update:newModelApiKeyEnv', $event.target.value)" placeholder="OPENAI_API_KEY" /></label>
+            <div></div>
           </div>
           <label>Custom api_key (optional) <input type="password" :value="newModelApiKey" @input="$emit('update:newModelApiKey', $event.target.value)" /></label>
           <label>Catalog
@@ -264,6 +288,7 @@ createApp({
     const state = reactive({
       config: {
         model: "",
+        active_provider: "openai",
         active_prompt: "",
         auto_exec_mode: "safe",
         model_catalog: [],
@@ -272,6 +297,7 @@ createApp({
     });
 
     const providerForm = reactive({
+      provider: "openai",
       base_url: "",
       model: "",
       api_key_env: "",
@@ -289,6 +315,7 @@ createApp({
 
     const selectedModel = ref("");
     const newModelName = ref("");
+    const newModelProvider = ref("openai");
     const newModelBaseUrl = ref("");
     const newModelApiKeyEnv = ref("");
     const newModelApiKey = ref("");
@@ -364,6 +391,7 @@ createApp({
     function hydrateForms() {
       providerForm.base_url = state.config.base_url || "";
       providerForm.model = state.config.model || "";
+      providerForm.provider = state.config.active_provider || "openai";
       providerForm.api_key_env = state.config.api_key_env || "";
       providerForm.api_key = "";
       providerForm.allow_nsfw = !!state.config.allow_nsfw;
@@ -396,6 +424,7 @@ createApp({
       await call("/api/config", "POST", {
         base_url: providerForm.base_url,
         model: providerForm.model,
+        provider: providerForm.provider,
         api_key_env: providerForm.api_key_env,
         api_key: providerForm.api_key,
         allow_nsfw: providerForm.allow_nsfw,
@@ -409,11 +438,13 @@ createApp({
       if (!name) return;
       await call("/api/model/add", "POST", {
         name,
+        provider: newModelProvider.value,
         base_url: newModelBaseUrl.value.trim() || null,
         api_key_env: newModelApiKeyEnv.value.trim() || null,
         api_key: newModelApiKey.value || null,
       });
       newModelName.value = "";
+      newModelProvider.value = "openai";
       newModelBaseUrl.value = "";
       newModelApiKeyEnv.value = "";
       newModelApiKey.value = "";
@@ -498,6 +529,7 @@ createApp({
       policyForm,
       selectedModel,
       newModelName,
+      newModelProvider,
       newModelBaseUrl,
       newModelApiKeyEnv,
       newModelApiKey,
@@ -541,11 +573,13 @@ createApp({
           :state="state"
           :selected-model="selectedModel"
           :new-model-name="newModelName"
+          :new-model-provider="newModelProvider"
           :new-model-base-url="newModelBaseUrl"
           :new-model-api-key-env="newModelApiKeyEnv"
           :new-model-api-key="newModelApiKey"
           @update:selected-model="selectedModel = $event"
           @update:new-model-name="newModelName = $event"
+          @update:new-model-provider="newModelProvider = $event"
           @update:new-model-base-url="newModelBaseUrl = $event"
           @update:new-model-api-key-env="newModelApiKeyEnv = $event"
           @update:new-model-api-key="newModelApiKey = $event"

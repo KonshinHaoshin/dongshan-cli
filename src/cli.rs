@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{AutoExecMode, ProviderPreset};
+use crate::config::{AutoExecMode, ModelApiProvider, ProviderPreset};
 
 #[derive(Parser, Debug)]
 #[command(name = "dongshan", version, about = "A simple AI coding CLI in Rust")]
@@ -175,6 +175,9 @@ pub enum ModelsCommand {
     /// Add a model to local catalog
     Add {
         name: String,
+        /// API provider type for this model profile
+        #[arg(long, value_enum)]
+        provider: Option<ModelApiProvider>,
         /// Optional custom base URL for this model profile
         #[arg(long)]
         base_url: Option<String>,
@@ -192,6 +195,8 @@ pub enum ModelsCommand {
     /// Set profile for one model
     SetProfile {
         name: String,
+        #[arg(long, value_enum)]
+        provider: Option<ModelApiProvider>,
         #[arg(long)]
         base_url: Option<String>,
         #[arg(long)]
@@ -200,4 +205,3 @@ pub enum ModelsCommand {
         api_key: Option<String>,
     },
 }
-

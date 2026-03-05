@@ -30,7 +30,11 @@ fn safe_filename(name: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() { "prompt".to_string() } else { s }
+    if s.is_empty() {
+        "prompt".to_string()
+    } else {
+        s
+    }
 }
 
 fn path_for_name(name: &str) -> Result<PathBuf> {
@@ -51,16 +55,18 @@ pub fn list_prompt_names() -> Result<Vec<String>> {
     ensure_default_prompt()?;
     let dir = root_dir()?;
     let mut out = Vec::new();
-    let entries = fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+    let entries =
+        fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-        let doc: PromptDoc =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON {}", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let doc: PromptDoc = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON {}", path.display()))?;
         out.push(doc.name);
     }
     out.sort();
@@ -72,16 +78,18 @@ pub fn list_prompts() -> Result<Vec<PromptDoc>> {
     ensure_default_prompt()?;
     let dir = root_dir()?;
     let mut out = Vec::new();
-    let entries = fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+    let entries =
+        fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-        let doc: PromptDoc =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON {}", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let doc: PromptDoc = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON {}", path.display()))?;
         out.push(doc);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -92,16 +100,18 @@ pub fn get_prompt(name: &str) -> Result<Option<String>> {
     ensure_default_prompt()?;
     let target = name.trim();
     let dir = root_dir()?;
-    let entries = fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+    let entries =
+        fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-        let doc: PromptDoc =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON {}", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let doc: PromptDoc = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON {}", path.display()))?;
         if doc.name == target {
             return Ok(Some(doc.content));
         }
@@ -134,18 +144,21 @@ pub fn remove_prompt(name: &str) -> Result<()> {
         bail!("Cannot remove default prompt");
     }
     let dir = root_dir()?;
-    let entries = fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+    let entries =
+        fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-        let doc: PromptDoc =
-            serde_json::from_str(&text).with_context(|| format!("Invalid JSON {}", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let doc: PromptDoc = serde_json::from_str(&text)
+            .with_context(|| format!("Invalid JSON {}", path.display()))?;
         if doc.name == target {
-            fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove {}", path.display()))?;
             return Ok(());
         }
     }
