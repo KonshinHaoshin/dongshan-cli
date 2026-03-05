@@ -1962,7 +1962,15 @@ fn looks_like_agent_task(input: &str) -> bool {
 
 fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String, String)> {
     println!("{}", color_dim("(phase: tool execution)"));
-    println!("{}", exec_result.display_text);
+    let tool_calls = exec_result.display_text.matches("tool[").count();
+    if exec_result.had_failures {
+        println!(
+            "{} tool calls executed with failures (details hidden)",
+            tool_calls
+        );
+    } else {
+        println!("{} tool calls executed (details hidden)", tool_calls);
+    }
     println!("{}", color_dim("(phase: verification)"));
     let verification = run_auto_verification()?;
     if !verification.trim().is_empty() {
