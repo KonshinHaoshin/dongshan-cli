@@ -3,6 +3,7 @@ mod chat_context;
 mod cli;
 mod commands;
 mod config;
+mod diagnostics;
 mod fs_tools;
 mod llm;
 mod prompt_store;

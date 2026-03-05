@@ -13,6 +13,7 @@ use crate::config::{
     load_config_or_default, remove_model, save_config, set_active_model,
     update_active_model_profile, upsert_model_profile,
 };
+use crate::diagnostics::{LastDiagnostic, read_last_diagnostic};
 use crate::prompt_store::{list_prompts, remove_prompt, save_prompt};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -100,6 +101,7 @@ async fn api_state() -> ApiResult<Json<StateResponse>> {
             model_catalog: cfg.model_catalog.clone(),
         },
         prompts: prompt_list,
+        last_diagnostic: read_last_diagnostic(),
     }))
 }
 
@@ -229,6 +231,7 @@ struct SimpleOk {
 struct StateResponse {
     config: ConfigSummary,
     prompts: Vec<PromptEntry>,
+    last_diagnostic: Option<LastDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]

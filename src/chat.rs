@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -16,6 +17,10 @@ use crate::config::{
     AutoExecMode, Config, ToolCallMode, active_effective_tool_mode, build_system_prompt,
     config_dir, current_prompt_text, ensure_model_catalog, save_config, set_active_model,
     set_model_tool_mode,
+};
+use crate::diagnostics::{
+    LastDiagnostic, TurnArtifact, now_unix_ts, read_last_diagnostic, write_last_diagnostic,
+    write_turn_artifact,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
@@ -35,6 +40,19 @@ const MAX_AUTO_TOOL_STEPS: usize = 3;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
 const MAX_INVALID_FORMAT_RETRIES: usize = 2;
+const MAX_WRITE_TASK_RETRIES: usize = 2;
+const MAX_WRITE_CLAIM_RETRIES: usize = 1;
+const MAX_DIFF_PREVIEW_FILES: usize = 20;
+const WRITE_TASK_RETRY_MSG: &str = "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result.";
+const WRITE_CLAIM_RETRY_MSG: &str = "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute the required tool_calls to create/update the target file.";
+
+#[derive(Default, Clone)]
+struct DiffPreviewCache {
+    key: String,
+    preview: String,
+}
+
+static DIFF_PREVIEW_CACHE: OnceLock<Mutex<DiffPreviewCache>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatExecutionMode {
@@ -115,7 +133,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
 
         maybe_compact_history(&mut history, &cfg);
         if use_agent {
-            run_agent_turn(&mut cfg, &mut history, "chat").await?;
+            run_agent_turn(&mut cfg, &mut history, "chat", Some(&active_session)).await?;
         } else {
             run_chat_turn(&mut cfg, &mut history, "chat-lite").await?;
         }
@@ -280,7 +298,7 @@ async fn submit_file_to_model(
     });
     maybe_compact_history(history, cfg);
     let system = build_system_prompt(cfg, "review");
-    run_agent_turn_with_system(cfg, history, &system).await
+    run_agent_turn_with_system(cfg, history, &system, None).await
 }
 
 fn has_followup_analysis_intent(input: &str, lower: &str) -> bool {
@@ -602,6 +620,7 @@ async fn handle_chat_slash_command(
             );
             c("/help", "show this message");
             c("/exit", "quit");
+            c("/status", "show model/tool/error status");
             c("/new [name]", "start a new session");
             c("/clear", "clear current session history");
             c("/session list", "list saved sessions");
@@ -706,6 +725,9 @@ async fn handle_chat_slash_command(
             } else {
                 println!("Usage: /mode show|chat|agent-auto|agent-force");
             }
+        }
+        "/status" => {
+            print_status(cfg)?;
         }
         "/read" => {
             let Some(file) = parts.next() else {
@@ -1734,27 +1756,32 @@ async fn run_agent_turn(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     mode: &str,
+    session: Option<&str>,
 ) -> Result<()> {
     let system = build_system_prompt(cfg, mode);
-    run_agent_turn_with_system(cfg, history, &system).await
+    run_agent_turn_with_system(cfg, history, &system, session).await
 }
 
 async fn run_agent_turn_with_system(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     system: &str,
+    session: Option<&str>,
 ) -> Result<()> {
     match active_effective_tool_mode(cfg) {
-        ToolCallMode::Json => run_agent_turn_with_system_legacy(cfg, history, system).await,
-        _ => match run_agent_turn_with_system_native(cfg, history, system).await {
+        ToolCallMode::Json => {
+            run_agent_turn_with_system_legacy(cfg, history, system, session).await
+        }
+        _ => match run_agent_turn_with_system_native(cfg, history, system, session).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 cache_active_model_tool_mode(cfg, ToolCallMode::Json);
+                record_diagnostic(cfg, "native-request", &err.to_string(), session);
                 println!(
                     "\nassistant> Native function-calling unavailable, fallback to JSON tool_calls parser: {}\n",
                     truncate_with_suffix(&err.to_string(), 220, " ...")
                 );
-                run_agent_turn_with_system_legacy(cfg, history, system).await
+                run_agent_turn_with_system_legacy(cfg, history, system, session).await
             }
         },
     }
@@ -1764,6 +1791,7 @@ async fn run_agent_turn_with_system_native(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     system: &str,
+    session: Option<&str>,
 ) -> Result<()> {
     let tools = native_tool_schemas();
     let mut messages = build_openai_messages(system, history);
@@ -1796,29 +1824,32 @@ async fn run_agent_turn_with_system_native(
 
         if resp.tool_calls.is_empty() {
             let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
+            record_step_artifact_from_native(
+                session,
+                cfg,
+                steps + 1,
+                "reasoning",
+                "chat",
+                &messages,
+                &answer,
+                &[],
+                Some(&exec_result),
+                &changed_baseline,
+            );
             if !exec_result.had_blocks {
                 let changed_now = current_changed_file_set().unwrap_or_default();
                 let changed_delta = changed_files_delta(&changed_baseline, &changed_now);
                 let last_user = last_user_text_from_native_messages(&messages).unwrap_or_default();
-                if looks_like_write_request(last_user)
-                    && changed_delta.is_empty()
-                    && write_task_retries < 2
-                {
-                    write_task_retries += 1;
+                if let Some(msg) = evaluate_write_guard(
+                    last_user,
+                    &answer,
+                    &changed_delta,
+                    &mut write_task_retries,
+                    &mut write_claim_retries,
+                ) {
                     messages.push(json!({
                         "role":"user",
-                        "content":"The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result."
-                    }));
-                    continue;
-                }
-                if looks_like_file_write_claim(&answer)
-                    && changed_delta.is_empty()
-                    && write_claim_retries < 1
-                {
-                    write_claim_retries += 1;
-                    messages.push(json!({
-                        "role":"user",
-                        "content":"You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute the required tool_calls to create/update the target file."
+                        "content": msg
                     }));
                     continue;
                 }
@@ -1871,10 +1902,29 @@ async fn run_agent_turn_with_system_native(
             }
 
             println!("assistant> Detected tool calls, but all were skipped or unsafe.\n");
+            record_diagnostic(
+                cfg,
+                "tool-protocol",
+                "tool calls detected but all were skipped or unsafe",
+                session,
+            );
             return Ok(());
         }
 
         let (exec_result, tool_msgs) = execute_native_function_calls(cfg, &resp.tool_calls)?;
+        let native_calls = native_calls_to_values(&resp.tool_calls, cfg, session);
+        record_step_artifact_from_native(
+            session,
+            cfg,
+            steps + 1,
+            "tool-exec",
+            "chat",
+            &messages,
+            &answer,
+            &native_calls,
+            Some(&exec_result),
+            &changed_baseline,
+        );
         for m in tool_msgs {
             messages.push(json!({
                 "role":"tool",
@@ -1914,6 +1964,12 @@ async fn run_agent_turn_with_system_native(
         }
 
         println!("assistant> Detected tool calls, but all were skipped or unsafe.\n");
+        record_diagnostic(
+            cfg,
+            "tool-protocol",
+            "native tool calls detected but all were skipped or unsafe",
+            session,
+        );
         return Ok(());
     }
 }
@@ -1932,6 +1988,7 @@ async fn run_agent_turn_with_system_legacy(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     system: &str,
+    session: Option<&str>,
 ) -> Result<()> {
     let changed_baseline = current_changed_file_set().unwrap_or_default();
     let mut steps = 0usize;
@@ -1955,6 +2012,7 @@ async fn run_agent_turn_with_system_legacy(
         let answer = match call_llm_with_history_stream(cfg, system, history).await {
             Ok(v) => v,
             Err(err) => {
+                record_diagnostic(cfg, "legacy-request", &err.to_string(), session);
                 println!("\n");
                 println!(
                     "assistant> Request interrupted: {}",
@@ -1972,6 +2030,19 @@ async fn run_agent_turn_with_system_legacy(
             .find(|m| m.role == "user")
             .map(|m| m.content.clone())
             .unwrap_or_default();
+        let parsed_calls = tool_calls_from_text(&answer);
+        record_step_artifact(
+            session,
+            cfg,
+            steps + 1,
+            "reasoning",
+            "chat",
+            &last_user,
+            &answer,
+            &parsed_calls,
+            Some(&exec_result),
+            &changed_baseline,
+        );
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
@@ -1980,25 +2051,16 @@ async fn run_agent_turn_with_system_legacy(
         if !exec_result.had_blocks {
             let changed_now = current_changed_file_set().unwrap_or_default();
             let changed_delta = changed_files_delta(&changed_baseline, &changed_now);
-            if looks_like_write_request(&last_user)
-                && changed_delta.is_empty()
-                && write_task_retries < 2
-            {
-                write_task_retries += 1;
+            if let Some(msg) = evaluate_write_guard(
+                &last_user,
+                &answer,
+                &changed_delta,
+                &mut write_task_retries,
+                &mut write_claim_retries,
+            ) {
                 history.push(ChatMessage {
                     role: "user".to_string(),
-                    content: "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result.".to_string(),
-                });
-                continue;
-            }
-            if looks_like_file_write_claim(&answer)
-                && changed_delta.is_empty()
-                && write_claim_retries < 1
-            {
-                write_claim_retries += 1;
-                history.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute the required tool_calls to create/update the target file.".to_string(),
+                    content: msg.to_string(),
                 });
                 continue;
             }
@@ -2048,6 +2110,12 @@ async fn run_agent_turn_with_system_legacy(
         println!(
             "assistant> Detected tool calls, but skipped because commands are unsafe or unsupported.\n"
         );
+        record_diagnostic(
+            cfg,
+            "tool-protocol",
+            "legacy tool calls detected but skipped because unsafe/unsupported",
+            session,
+        );
         return Ok(());
     }
 }
@@ -2084,44 +2152,88 @@ fn contains_code_execution_hint(text: &str) -> bool {
 
 fn looks_like_file_write_claim(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    let en = t.contains("created")
+    let success = t.contains("created")
         || t.contains("written")
         || t.contains("saved")
         || t.contains("file created")
         || t.contains("analysis.md has been created")
         || t.contains("created in root")
         || t.contains("updated file");
-    let zh = text.contains("已创建")
+    let zh_success = text.contains("已创建")
         || text.contains("已写入")
         || text.contains("已保存")
         || text.contains("创建了")
         || text.contains("写入了")
         || text.contains("文件已生成")
         || text.contains("已生成");
-    en || zh
+    let target_hint = has_file_target_hint(text);
+    (success || zh_success) && target_hint
 }
 
 fn looks_like_write_request(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    let en = t.contains("write ")
+    let action_en = t.contains("write ")
         || t.contains("create ")
         || t.contains("save ")
         || t.contains("generate ")
-        || t.contains("put in root")
-        || t.contains(".md")
-        || t.contains(".txt")
-        || t.contains(".json")
-        || t.contains("file");
-    let zh = text.contains("写")
+        || t.contains("modify ")
+        || t.contains("edit ")
+        || t.contains("update ")
+        || t.contains("put in root");
+    let action_zh = text.contains("写")
         || text.contains("创建")
         || text.contains("保存")
         || text.contains("生成")
-        || text.contains("放在根目录")
-        || text.contains(".md")
-        || text.contains(".txt")
-        || text.contains(".json")
-        || text.contains("文件");
-    en || zh
+        || text.contains("修改")
+        || text.contains("编辑")
+        || text.contains("更新")
+        || text.contains("放在根目录");
+    let negative = t.contains("do not write")
+        || t.contains("don't write")
+        || text.contains("不要写")
+        || text.contains("不用写");
+    !negative && (action_en || action_zh) && has_file_target_hint(text)
+}
+
+fn has_file_target_hint(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains(".md")
+        || t.contains(".txt")
+        || t.contains(".json")
+        || t.contains(".toml")
+        || t.contains(".yaml")
+        || t.contains(".yml")
+        || t.contains(".rs")
+        || t.contains(".py")
+        || t.contains(" file ")
+        || t.contains("root directory")
+        || t.contains("root/")
+        || text.contains("文件")
+        || text.contains("根目录")
+}
+
+fn evaluate_write_guard(
+    last_user: &str,
+    answer: &str,
+    changed_delta: &[String],
+    write_task_retries: &mut usize,
+    write_claim_retries: &mut usize,
+) -> Option<&'static str> {
+    if changed_delta.is_empty()
+        && looks_like_write_request(last_user)
+        && *write_task_retries < MAX_WRITE_TASK_RETRIES
+    {
+        *write_task_retries += 1;
+        return Some(WRITE_TASK_RETRY_MSG);
+    }
+    if changed_delta.is_empty()
+        && looks_like_file_write_claim(answer)
+        && *write_claim_retries < MAX_WRITE_CLAIM_RETRIES
+    {
+        *write_claim_retries += 1;
+        return Some(WRITE_CLAIM_RETRY_MSG);
+    }
+    None
 }
 
 fn last_user_text_from_native_messages(messages: &[Value]) -> Option<&str> {
@@ -2204,6 +2316,7 @@ async fn run_chat_turn(cfg: &mut Config, history: &mut Vec<ChatMessage>, mode: &
     let answer = match call_llm_with_history_stream(cfg, &system, history).await {
         Ok(v) => v,
         Err(err) => {
+            record_diagnostic(cfg, "chat-lite-request", &err.to_string(), None);
             println!("\n");
             println!(
                 "assistant> Request interrupted: {}",
@@ -2357,7 +2470,8 @@ fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String,
     if !verification.trim().is_empty() && !verification.starts_with("verification: skipped") {
         println!("{} {}", color_dim("verify>"), verification);
     }
-    let diff_preview = collect_diff_preview();
+    let changed_now = current_changed_file_set().unwrap_or_default();
+    let diff_preview = collect_diff_preview(&changed_now);
     if !diff_preview.trim().is_empty() {
         println!(
             "{} {}",
@@ -2394,8 +2508,26 @@ fn run_auto_verification() -> Result<String> {
     ))
 }
 
-fn collect_diff_preview() -> String {
-    let output = Command::new("git").arg("diff").arg("--no-color").output();
+fn collect_diff_preview(changed: &BTreeSet<String>) -> String {
+    if changed.is_empty() {
+        return "diff: no local changes".to_string();
+    }
+
+    let key = build_diff_cache_key(changed);
+    let cache = DIFF_PREVIEW_CACHE.get_or_init(|| Mutex::new(DiffPreviewCache::default()));
+    if let Ok(guard) = cache.lock()
+        && guard.key == key
+        && !guard.preview.is_empty()
+    {
+        return guard.preview.clone();
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("diff").arg("--no-color").arg("--");
+    for p in changed.iter().take(MAX_DIFF_PREVIEW_FILES) {
+        cmd.arg(p);
+    }
+    let output = cmd.output();
     let Ok(output) = output else {
         return String::new();
     };
@@ -2403,10 +2535,36 @@ fn collect_diff_preview() -> String {
         return String::new();
     }
     let text = String::from_utf8_lossy(&output.stdout).to_string();
-    if text.trim().is_empty() {
-        return "diff: no local changes".to_string();
+    let mut preview = if text.trim().is_empty() {
+        "diff: no local changes".to_string()
+    } else {
+        let mut out = format!("diff preview:\n{}", clip_output(&text, 5000));
+        if changed.len() > MAX_DIFF_PREVIEW_FILES {
+            out.push_str(&format!(
+                "\n(diff limited to first {} changed files; total changed: {})",
+                MAX_DIFF_PREVIEW_FILES,
+                changed.len()
+            ));
+        }
+        out
+    };
+    if preview.is_empty() {
+        preview = "diff: no local changes".to_string();
     }
-    format!("diff preview:\n{}", clip_output(&text, 5000))
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.key = key;
+        guard.preview = preview.clone();
+    }
+    preview
+}
+
+fn build_diff_cache_key(changed: &BTreeSet<String>) -> String {
+    changed
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn pick_verification_command() -> Option<(&'static str, &'static str)> {
@@ -3016,7 +3174,7 @@ pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Resul
     });
 
     maybe_compact_history(&mut history, &cfg);
-    run_agent_turn(&mut cfg, &mut history, "chat").await?;
+    run_agent_turn(&mut cfg, &mut history, "chat", Some(&active_session)).await?;
     save_session(&active_session, &history)?;
 
     let changed = list_workspace_changed_files()?;
@@ -3029,6 +3187,153 @@ pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Resul
         }
     }
     Ok(())
+}
+
+fn print_status(cfg: &Config) -> Result<()> {
+    let provider = cfg
+        .model_profiles
+        .get(&cfg.model)
+        .map(|p| format!("{:?}", p.provider))
+        .unwrap_or_else(|| "unknown".to_string());
+    let tool_mode = format!("{:?}", active_effective_tool_mode(cfg));
+    println!("model: {}", cfg.model);
+    println!("provider: {}", provider);
+    println!("tool_mode: {}", tool_mode);
+    let changed = list_workspace_changed_files()?;
+    println!("changed_files: {}", changed.len());
+    for p in changed.iter().take(8) {
+        println!("- {}", p);
+    }
+    if let Some(diag) = read_last_diagnostic() {
+        println!(
+            "last_error: [{}] {}",
+            diag.phase,
+            truncate_with_suffix(&diag.message, 180, " ...")
+        );
+    } else {
+        println!("last_error: (none)");
+    }
+    Ok(())
+}
+
+fn record_diagnostic(cfg: &Config, phase: &str, message: &str, session: Option<&str>) {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string());
+    let diag = LastDiagnostic {
+        timestamp_unix: now_unix_ts(),
+        model: cfg.model.clone(),
+        phase: phase.to_string(),
+        message: message.to_string(),
+        session: session.map(|s| s.to_string()),
+        cwd,
+    };
+    let _ = write_last_diagnostic(&diag);
+}
+
+fn record_step_artifact_from_native(
+    session: Option<&str>,
+    cfg: &Config,
+    step: usize,
+    phase: &str,
+    prompt_mode: &str,
+    messages: &[Value],
+    response: &str,
+    tool_calls: &[Value],
+    exec_result: Option<&ExecResult>,
+    changed_baseline: &BTreeSet<String>,
+) {
+    let request = last_user_text_from_native_messages(messages)
+        .unwrap_or_default()
+        .to_string();
+    record_step_artifact(
+        session,
+        cfg,
+        step,
+        phase,
+        prompt_mode,
+        &request,
+        response,
+        tool_calls,
+        exec_result,
+        changed_baseline,
+    );
+}
+
+fn record_step_artifact(
+    session: Option<&str>,
+    cfg: &Config,
+    step: usize,
+    phase: &str,
+    prompt_mode: &str,
+    request: &str,
+    response: &str,
+    tool_calls: &[Value],
+    exec_result: Option<&ExecResult>,
+    changed_baseline: &BTreeSet<String>,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let changed_now = current_changed_file_set().unwrap_or_default();
+    let changed_files = changed_files_delta(changed_baseline, &changed_now);
+    let artifact = TurnArtifact {
+        timestamp_unix: now_unix_ts(),
+        session: session.to_string(),
+        model: cfg.model.clone(),
+        step,
+        phase: phase.to_string(),
+        prompt_mode: prompt_mode.to_string(),
+        request: truncate_with_suffix(request, 8000, "..."),
+        response: truncate_with_suffix(response, 12000, "..."),
+        tool_calls: tool_calls.to_vec(),
+        executed_any: exec_result.map(|e| e.executed_any).unwrap_or(false),
+        had_failures: exec_result.map(|e| e.had_failures).unwrap_or(false),
+        changed_files,
+    };
+    let _ = write_turn_artifact(session, &artifact);
+}
+
+fn native_calls_to_values(
+    calls: &[NativeFunctionCall],
+    cfg: &Config,
+    session: Option<&str>,
+) -> Vec<Value> {
+    calls
+        .iter()
+        .map(|c| {
+            let args = match serde_json::from_str::<Value>(&c.arguments) {
+                Ok(v) => v,
+                Err(e) => {
+                    record_diagnostic(
+                        cfg,
+                        "native-call-args-parse",
+                        &format!("tool={} id={} parse_error={}", c.name, c.id, e),
+                        session,
+                    );
+                    json!({ "raw_arguments": c.arguments })
+                }
+            };
+            json!({
+                "id": c.id,
+                "name": c.name,
+                "args": args
+            })
+        })
+        .collect()
+}
+
+fn tool_calls_from_text(text: &str) -> Vec<Value> {
+    extract_tool_calls(text)
+        .into_iter()
+        .map(|c| {
+            json!({
+                "tool": c.tool,
+                "command": c.command,
+                "args": c.args
+            })
+        })
+        .collect()
 }
 
 fn list_saved_sessions() -> Result<Vec<String>> {

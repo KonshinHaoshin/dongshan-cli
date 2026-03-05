@@ -49,8 +49,8 @@ const TopBar = {
 };
 
 const OverviewPage = {
-  props: ["logs"],
-  emits: ["switch-page", "refresh"],
+  props: ["logs", "lastDiagnostic"],
+  emits: ["switch-page", "refresh", "copy-diagnostic"],
   template: `
     <section>
       <div class="grid">
@@ -70,6 +70,19 @@ const OverviewPage = {
             <button class="secondary" @click="$emit('switch-page', 'prompts')">Go Prompts</button>
             <button class="secondary" @click="$emit('switch-page', 'models')">Go Models</button>
           </div>
+        </div>
+        <div class="card">
+          <h3>Last Diagnostic</h3>
+          <div v-if="lastDiagnostic">
+            <div><b>time:</b> {{ new Date(lastDiagnostic.timestamp_unix * 1000).toLocaleString() }}</div>
+            <div><b>model:</b> {{ lastDiagnostic.model }}</div>
+            <div><b>phase:</b> {{ lastDiagnostic.phase }}</div>
+            <pre class="code">{{ lastDiagnostic.message }}</pre>
+            <div class="actions">
+              <button class="secondary" @click="$emit('copy-diagnostic')">Copy Diagnostic</button>
+            </div>
+          </div>
+          <div v-else class="small">No diagnostic yet.</div>
         </div>
       </div>
     </section>
@@ -294,6 +307,7 @@ createApp({
         model_catalog: [],
       },
       prompts: [],
+      last_diagnostic: null,
     });
 
     const providerForm = reactive({
@@ -410,8 +424,16 @@ createApp({
       const data = await call("/api/state");
       state.config = data.config || {};
       state.prompts = data.prompts || [];
+      state.last_diagnostic = data.last_diagnostic || null;
       hydrateForms();
       toast("state refreshed");
+    }
+
+    async function copyDiagnostic() {
+      if (!state.last_diagnostic) return;
+      const text = JSON.stringify(state.last_diagnostic, null, 2);
+      await navigator.clipboard.writeText(text);
+      toast("diagnostic copied");
     }
 
     function loadSelectedPrompt() {
@@ -547,6 +569,7 @@ createApp({
       usePrompt,
       deletePrompt,
       savePolicy,
+      copyDiagnostic,
     };
   },
   template: `
@@ -558,8 +581,10 @@ createApp({
         <OverviewPage
           v-if="activePage === 'overview'"
           :logs="logs"
+          :last-diagnostic="state.last_diagnostic"
           @switch-page="switchPage"
           @refresh="refresh"
+          @copy-diagnostic="copyDiagnostic"
         />
 
         <ProviderPage
