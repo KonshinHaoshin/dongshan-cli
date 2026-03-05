@@ -25,8 +25,20 @@ pub enum ModelApiProvider {
     At,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallMode {
+    Auto,
+    Native,
+    Json,
+}
+
 fn default_model_provider() -> ModelApiProvider {
     ModelApiProvider::Openai
+}
+
+fn default_tool_call_mode() -> ToolCallMode {
+    ToolCallMode::Auto
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
@@ -41,6 +53,8 @@ pub enum AutoExecMode {
 pub struct ModelProfile {
     #[serde(default = "default_model_provider")]
     pub provider: ModelApiProvider,
+    #[serde(default = "default_tool_call_mode")]
+    pub tool_mode: ToolCallMode,
     pub base_url: String,
     pub api_key_env: String,
     #[serde(default)]
@@ -92,6 +106,7 @@ impl Default for Config {
             model.clone(),
             ModelProfile {
                 provider: ModelApiProvider::Openai,
+                tool_mode: ToolCallMode::Auto,
                 base_url: base_url.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
@@ -208,6 +223,7 @@ pub fn apply_preset(cfg: &mut Config, provider: ProviderPreset) {
         model.clone(),
         ModelProfile {
             provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url,
             api_key_env,
             api_key: cfg.api_key.clone(),
@@ -299,6 +315,11 @@ pub fn ensure_model_catalog(cfg: &mut Config) {
             .get(&cfg.model)
             .map(|p| p.provider)
             .unwrap_or(ModelApiProvider::Openai),
+        tool_mode: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.tool_mode)
+            .unwrap_or(ToolCallMode::Auto),
         base_url: cfg.base_url.clone(),
         api_key_env: cfg.api_key_env.clone(),
         api_key: cfg.api_key.clone(),
@@ -364,6 +385,11 @@ pub fn update_active_model_profile(cfg: &mut Config) {
                 .get(&cfg.model)
                 .map(|p| p.provider)
                 .unwrap_or(ModelApiProvider::Openai),
+            tool_mode: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.tool_mode)
+                .unwrap_or(ToolCallMode::Auto),
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -396,6 +422,7 @@ pub fn add_model_with_active_profile(cfg: &mut Config, model: &str) {
         .cloned()
         .unwrap_or(ModelProfile {
             provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -439,6 +466,7 @@ pub fn upsert_model_profile(
         .cloned()
         .unwrap_or(ModelProfile {
             provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -502,6 +530,34 @@ pub fn resolve_api_key(cfg: &Config) -> Result<String> {
     )
 }
 
+pub fn effective_tool_mode(cfg: &Config, model: &str) -> ToolCallMode {
+    let Some(p) = cfg.model_profiles.get(model) else {
+        return ToolCallMode::Native;
+    };
+    match p.tool_mode {
+        ToolCallMode::Auto => match p.provider {
+            ModelApiProvider::At => ToolCallMode::Json,
+            ModelApiProvider::Openai => ToolCallMode::Native,
+        },
+        v => v,
+    }
+}
+
+pub fn active_effective_tool_mode(cfg: &Config) -> ToolCallMode {
+    effective_tool_mode(cfg, &cfg.model)
+}
+
+pub fn set_model_tool_mode(cfg: &mut Config, model: &str, mode: ToolCallMode) {
+    let name = model.trim();
+    if name.is_empty() {
+        return;
+    }
+    ensure_model_catalog(cfg);
+    if let Some(p) = cfg.model_profiles.get_mut(name) {
+        p.tool_mode = mode;
+    }
+}
+
 pub fn render_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = input.to_string();
     for (k, v) in vars {
@@ -531,8 +587,19 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
         prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
-        prompt.push_str("\nUse OpenAI native function-calling first; use shell only when native fs functions are insufficient.");
-        prompt.push_str("\nIf function-calling is unavailable, fallback to strict JSON tool_calls. Never use markdown shell blocks.");
+        match active_effective_tool_mode(cfg) {
+            ToolCallMode::Json => {
+                prompt.push_str("\nTool protocol mode: json.");
+                prompt.push_str("\nDo not use native function-calling.");
+                prompt.push_str("\nWhen execution is needed, output only strict JSON object: {\"tool_calls\":[...]}.");
+                prompt.push_str("\nNo markdown fences. No prose around JSON.");
+                prompt.push_str("\nIf no execution is needed, output final answer directly.");
+            }
+            _ => {
+                prompt.push_str("\nUse OpenAI native function-calling first; use shell only when native fs functions are insufficient.");
+                prompt.push_str("\nIf function-calling is unavailable, fallback to strict JSON tool_calls. Never use markdown shell blocks.");
+            }
+        }
         prompt.push_str("\nSupported tools:");
         prompt.push_str("\n- fs_read_file args: {path}");
         prompt.push_str("\n- fs_create_file args: {path, content, overwrite?}");

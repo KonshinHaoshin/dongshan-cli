@@ -66,6 +66,7 @@ pub fn handle_models(command: ModelsCommand) -> Result<()> {
             };
             println!("Model: {}", target);
             println!("  provider: {:?}", p.provider);
+            println!("  tool_mode: {:?}", p.tool_mode);
             println!("  base_url: {}", p.base_url);
             println!("  api_key_env: {}", p.api_key_env);
             println!(

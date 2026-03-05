@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
 use crate::config::{
-    AutoExecMode, Config, build_system_prompt, config_dir, current_prompt_text,
-    ensure_model_catalog, save_config, set_active_model,
+    AutoExecMode, Config, ToolCallMode, active_effective_tool_mode, build_system_prompt,
+    config_dir, current_prompt_text, ensure_model_catalog, save_config, set_active_model,
+    set_model_tool_mode,
 };
 use crate::fs_tools::{
     grep_output, grep_recursive, list_files_output, list_files_recursive, read_text_file,
@@ -871,6 +872,28 @@ struct NativeToolExecution {
 fn maybe_execute_assistant_commands(cfg: &mut Config, answer: &str) -> Result<ExecResult> {
     let calls = extract_tool_calls(answer);
     if calls.is_empty() {
+        if contains_code_execution_hint(answer) {
+            let msg = "Detected incompatible tool protocol: `code_execution`.\nThis model/gateway is not following dongshan JSON tool_calls schema, so execution is skipped.\nPlease switch to a model/provider that supports OpenAI function-calling or strict JSON tool_calls.\n";
+            let records = vec![ToolResultRecord {
+                tool: "tool_parser".to_string(),
+                status: "error".to_string(),
+                output: String::new(),
+                error: Some(msg.trim().to_string()),
+                changed_files: Vec::new(),
+            }];
+            return Ok(ExecResult {
+                executed_any: false,
+                had_blocks: true,
+                skipped_any: true,
+                invalid_format: true,
+                had_failures: false,
+                display_text: format!("\n{}", msg),
+                history_text: format!(
+                    "tool[native.exec] results:\n{}",
+                    serialize_tool_results(&records)
+                ),
+            });
+        }
         if contains_legacy_shell_block(answer) {
             let msg = "Detected legacy shell block. Skipped: use JSON tool_calls instead.\n";
             let records = vec![ToolResultRecord {
@@ -1721,15 +1744,19 @@ async fn run_agent_turn_with_system(
     history: &mut Vec<ChatMessage>,
     system: &str,
 ) -> Result<()> {
-    match run_agent_turn_with_system_native(cfg, history, system).await {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            println!(
-                "\nassistant> Native function-calling unavailable, fallback to JSON tool_calls parser: {}\n",
-                truncate_with_suffix(&err.to_string(), 220, " ...")
-            );
-            run_agent_turn_with_system_legacy(cfg, history, system).await
-        }
+    match active_effective_tool_mode(cfg) {
+        ToolCallMode::Json => run_agent_turn_with_system_legacy(cfg, history, system).await,
+        _ => match run_agent_turn_with_system_native(cfg, history, system).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                cache_active_model_tool_mode(cfg, ToolCallMode::Json);
+                println!(
+                    "\nassistant> Native function-calling unavailable, fallback to JSON tool_calls parser: {}\n",
+                    truncate_with_suffix(&err.to_string(), 220, " ...")
+                );
+                run_agent_turn_with_system_legacy(cfg, history, system).await
+            }
+        },
     }
 }
 
@@ -1740,8 +1767,12 @@ async fn run_agent_turn_with_system_native(
 ) -> Result<()> {
     let tools = native_tool_schemas();
     let mut messages = build_openai_messages(system, history);
+    let changed_baseline = current_changed_file_set().unwrap_or_default();
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
+    let mut invalid_format_retries = 0usize;
+    let mut write_claim_retries = 0usize;
+    let mut write_task_retries = 0usize;
     loop {
         compact_native_messages(&mut messages, cfg.history_max_chars.max(2000));
         println!(
@@ -1764,10 +1795,82 @@ async fn run_agent_turn_with_system_native(
         messages.push(resp.assistant_message);
 
         if resp.tool_calls.is_empty() {
-            history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: answer,
-            });
+            let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
+            if !exec_result.had_blocks {
+                let changed_now = current_changed_file_set().unwrap_or_default();
+                let changed_delta = changed_files_delta(&changed_baseline, &changed_now);
+                let last_user = last_user_text_from_native_messages(&messages).unwrap_or_default();
+                if looks_like_write_request(last_user)
+                    && changed_delta.is_empty()
+                    && write_task_retries < 2
+                {
+                    write_task_retries += 1;
+                    messages.push(json!({
+                        "role":"user",
+                        "content":"The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result."
+                    }));
+                    continue;
+                }
+                if looks_like_file_write_claim(&answer)
+                    && changed_delta.is_empty()
+                    && write_claim_retries < 1
+                {
+                    write_claim_retries += 1;
+                    messages.push(json!({
+                        "role":"user",
+                        "content":"You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute the required tool_calls to create/update the target file."
+                    }));
+                    continue;
+                }
+                history.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: answer,
+                });
+                return Ok(());
+            }
+
+            cache_active_model_tool_mode(cfg, ToolCallMode::Json);
+            if exec_result.executed_any {
+                let (verification, recovery_hint) = print_execution_and_verification(&exec_result)?;
+                messages.push(json!({
+                    "role":"user",
+                    "content": format!(
+                        "{}\n{}{}\nContinue based on tool outputs above. If more execution is needed, emit JSON tool_calls. If complete, give final answer directly with short summary, changed files, and verification result.",
+                        exec_result.history_text,
+                        verification,
+                        recovery_hint
+                    )
+                }));
+                steps += 1;
+                if steps >= MAX_AUTO_TOOL_STEPS {
+                    println!(
+                        "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
+                        MAX_AUTO_TOOL_STEPS
+                    );
+                    return Ok(());
+                }
+                continue;
+            }
+
+            if exec_result.invalid_format && invalid_format_retries < MAX_INVALID_FORMAT_RETRIES {
+                invalid_format_retries += 1;
+                messages.push(json!({
+                    "role":"user",
+                    "content":"Your last response had invalid tool_calls format. Use strict JSON like {\"tool_calls\":[{\"tool\":\"fs.read_file\",\"args\":{\"path\":\"src/main.rs\"}}]} or {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]}."
+                }));
+                continue;
+            }
+
+            if exec_result.skipped_any && unsafe_retries < 1 {
+                unsafe_retries += 1;
+                messages.push(json!({
+                    "role":"user",
+                    "content":"Your last response used unsupported execution format or unsafe commands. Use JSON tool_calls only, and only when needed. Otherwise provide direct final analysis/result."
+                }));
+                continue;
+            }
+
+            println!("assistant> Detected tool calls, but all were skipped or unsafe.\n");
             return Ok(());
         }
 
@@ -1815,14 +1918,27 @@ async fn run_agent_turn_with_system_native(
     }
 }
 
+fn cache_active_model_tool_mode(cfg: &mut Config, mode: ToolCallMode) {
+    let model = cfg.model.clone();
+    let current = cfg.model_profiles.get(&model).map(|p| p.tool_mode);
+    if current == Some(mode) {
+        return;
+    }
+    set_model_tool_mode(cfg, &model, mode);
+    let _ = save_config(cfg);
+}
+
 async fn run_agent_turn_with_system_legacy(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     system: &str,
 ) -> Result<()> {
+    let changed_baseline = current_changed_file_set().unwrap_or_default();
     let mut steps = 0usize;
     let mut unsafe_retries = 0usize;
     let mut invalid_format_retries = 0usize;
+    let mut write_claim_retries = 0usize;
+    let mut write_task_retries = 0usize;
     loop {
         maybe_compact_history(history, cfg);
         println!(
@@ -1850,12 +1966,42 @@ async fn run_agent_turn_with_system_legacy(
         };
         println!("\n");
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
+        let last_user = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
         });
 
         if !exec_result.had_blocks {
+            let changed_now = current_changed_file_set().unwrap_or_default();
+            let changed_delta = changed_files_delta(&changed_baseline, &changed_now);
+            if looks_like_write_request(&last_user)
+                && changed_delta.is_empty()
+                && write_task_retries < 2
+            {
+                write_task_retries += 1;
+                history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result.".to_string(),
+                });
+                continue;
+            }
+            if looks_like_file_write_claim(&answer)
+                && changed_delta.is_empty()
+                && write_claim_retries < 1
+            {
+                write_claim_retries += 1;
+                history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute the required tool_calls to create/update the target file.".to_string(),
+                });
+                continue;
+            }
             return Ok(());
         }
 
@@ -1919,14 +2065,82 @@ fn contains_tool_call_hint(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     t.contains("tool_calls")
         || t.contains("\"tool\"")
+        || t.contains("code_execution")
+        || t.contains("<think>")
+        || t.contains("</think>")
+        || t.contains("function_call")
         || t.contains("```json")
         || t.contains("``json")
         || t.contains("<|tool_call_argument_begin|>")
+}
+
+fn contains_code_execution_hint(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("code_execution")
+        || t.contains("\"code_execution\"")
+        || t.contains("<think>")
+        || t.contains("</think>")
+}
+
+fn looks_like_file_write_claim(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let en = t.contains("created")
+        || t.contains("written")
+        || t.contains("saved")
+        || t.contains("file created")
+        || t.contains("analysis.md has been created")
+        || t.contains("created in root")
+        || t.contains("updated file");
+    let zh = text.contains("已创建")
+        || text.contains("已写入")
+        || text.contains("已保存")
+        || text.contains("创建了")
+        || text.contains("写入了")
+        || text.contains("文件已生成")
+        || text.contains("已生成");
+    en || zh
+}
+
+fn looks_like_write_request(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    let en = t.contains("write ")
+        || t.contains("create ")
+        || t.contains("save ")
+        || t.contains("generate ")
+        || t.contains("put in root")
+        || t.contains(".md")
+        || t.contains(".txt")
+        || t.contains(".json")
+        || t.contains("file");
+    let zh = text.contains("写")
+        || text.contains("创建")
+        || text.contains("保存")
+        || text.contains("生成")
+        || text.contains("放在根目录")
+        || text.contains(".md")
+        || text.contains(".txt")
+        || text.contains(".json")
+        || text.contains("文件");
+    en || zh
+}
+
+fn last_user_text_from_native_messages(messages: &[Value]) -> Option<&str> {
+    for m in messages.iter().rev() {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or_default();
+        if role != "user" {
+            continue;
+        }
+        if let Some(s) = m.get("content").and_then(|v| v.as_str()) {
+            return Some(s);
+        }
+    }
+    None
 }
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
     collect_tool_calls_from_fence(text, "```json", "```", false, &mut out);
     collect_tool_calls_from_inline_json(text, &mut out);
+    collect_tool_calls_from_code_execution(text, &mut out);
     out
 }
 fn collect_tool_calls_from_fence(
@@ -2143,12 +2357,25 @@ fn print_execution_and_verification(exec_result: &ExecResult) -> Result<(String,
     if !verification.trim().is_empty() && !verification.starts_with("verification: skipped") {
         println!("{} {}", color_dim("verify>"), verification);
     }
+    let diff_preview = collect_diff_preview();
+    if !diff_preview.trim().is_empty() {
+        println!(
+            "{} {}",
+            color_dim("diff>"),
+            diff_preview.lines().next().unwrap_or_default()
+        );
+    }
     let recovery_hint = if exec_result.had_failures {
         "\nSome commands failed. Prefer narrower retries: check file/path existence first, then rerun minimal commands.".to_string()
     } else {
         String::new()
     };
-    Ok((verification, recovery_hint))
+    let mut combined = verification;
+    if !diff_preview.trim().is_empty() {
+        combined.push('\n');
+        combined.push_str(&diff_preview);
+    }
+    Ok((combined, recovery_hint))
 }
 
 fn run_auto_verification() -> Result<String> {
@@ -2165,6 +2392,21 @@ fn run_auto_verification() -> Result<String> {
     Ok(format!(
         "verification[{label}] {status}\n$ {cmd}\n{clipped}"
     ))
+}
+
+fn collect_diff_preview() -> String {
+    let output = Command::new("git").arg("diff").arg("--no-color").output();
+    let Ok(output) = output else {
+        return String::new();
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    if text.trim().is_empty() {
+        return "diff: no local changes".to_string();
+    }
+    format!("diff preview:\n{}", clip_output(&text, 5000))
 }
 
 fn pick_verification_command() -> Option<(&'static str, &'static str)> {
@@ -2204,6 +2446,154 @@ fn collect_tool_calls_from_inline_json(text: &str, out: &mut Vec<ToolCall>) {
         }
         i += 1;
     }
+}
+
+fn collect_tool_calls_from_code_execution(text: &str, out: &mut Vec<ToolCall>) {
+    let marker = "code_execution";
+    let mut i = 0usize;
+    while i < text.len() {
+        let Some(pos_rel) = text[i..].find(marker) else {
+            break;
+        };
+        let pos = i + pos_rel;
+        let Some(obj_start_rel) = text[pos..].find('{') else {
+            i = pos + marker.len();
+            continue;
+        };
+        let obj_start = pos + obj_start_rel;
+        let Some(obj_end) = find_matching_brace(text, obj_start) else {
+            i = obj_start + 1;
+            continue;
+        };
+        let candidate = &text[obj_start..=obj_end];
+        if let Ok(value) = serde_json::from_str::<Value>(candidate)
+            && let Some(code) = value.get("code").and_then(|v| v.as_str())
+        {
+            collect_tool_calls_from_python_code(code, out);
+        }
+        i = obj_end + 1;
+    }
+}
+
+fn collect_tool_calls_from_python_code(code: &str, out: &mut Vec<ToolCall>) {
+    if let Some((path, content)) = parse_python_write_file(code) {
+        out.push(ToolCall {
+            tool: "fs_create_file".to_string(),
+            command: String::new(),
+            args: json!({
+                "path": path,
+                "content": content,
+                "overwrite": true
+            }),
+        });
+        return;
+    }
+    if let Some(path) = parse_python_read_file(code) {
+        out.push(ToolCall {
+            tool: "fs_read_file".to_string(),
+            command: String::new(),
+            args: json!({ "path": path }),
+        });
+        return;
+    }
+    if let Some(path) = parse_python_listdir(code) {
+        out.push(ToolCall {
+            tool: "fs_list_files".to_string(),
+            command: String::new(),
+            args: json!({ "path": path }),
+        });
+    }
+}
+
+fn parse_python_write_file(code: &str) -> Option<(String, String)> {
+    let open_pos = code.find("open(")?;
+    let open_args = &code[open_pos + "open(".len()..];
+    let (path, _) = parse_python_string_literal(open_args)?;
+    let open_close = open_args.find(')')?;
+    let mode_seg = &open_args[..open_close].to_ascii_lowercase();
+    if !(mode_seg.contains("'w'") || mode_seg.contains("\"w\"")) {
+        return None;
+    }
+
+    let write_pos = code.find(".write(")?;
+    let write_args = &code[write_pos + ".write(".len()..];
+    let (content, _) = parse_python_string_literal(write_args)?;
+    Some((path, content))
+}
+
+fn parse_python_read_file(code: &str) -> Option<String> {
+    let open_pos = code.find("open(")?;
+    let open_args = &code[open_pos + "open(".len()..];
+    let (path, _) = parse_python_string_literal(open_args)?;
+    let open_close = open_args.find(')')?;
+    let mode_seg = &open_args[..open_close].to_ascii_lowercase();
+    if mode_seg.contains("'w'") || mode_seg.contains("\"w\"") {
+        return None;
+    }
+    Some(path)
+}
+
+fn parse_python_listdir(code: &str) -> Option<String> {
+    let pos = code.find("os.listdir(")?;
+    let args = &code[pos + "os.listdir(".len()..];
+    let trimmed = args.trim_start();
+    if trimmed.starts_with(')') {
+        return Some(".".to_string());
+    }
+    let (path, _) = parse_python_string_literal(trimmed)?;
+    Some(path)
+}
+
+fn parse_python_string_literal(input: &str) -> Option<(String, usize)> {
+    let s = input.trim_start();
+    let skipped = input.len() - s.len();
+    if s.len() < 2 {
+        return None;
+    }
+
+    for quote in ["\"\"\"", "'''"] {
+        if let Some(body) = s.strip_prefix(quote)
+            && let Some(end) = body.find(quote)
+        {
+            let content = body[..end].to_string();
+            return Some((content, skipped + quote.len() + end + quote.len()));
+        }
+    }
+
+    let first = s.chars().next()?;
+    if first != '"' && first != '\'' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    let mut end_idx = None;
+    for (idx, ch) in s.char_indices().skip(1) {
+        if escaped {
+            let decoded = match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                other => other,
+            };
+            out.push(decoded);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == first {
+            end_idx = Some(idx);
+            break;
+        }
+        out.push(ch);
+    }
+    let end = end_idx?;
+    Some((out, skipped + end + 1))
 }
 
 fn find_matching_brace(text: &str, start: usize) -> Option<usize> {
