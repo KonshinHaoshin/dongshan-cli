@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use crate::cli::ConfigCommand;
 use crate::config::{
-    Config, apply_preset, config_path, ensure_model_catalog, load_config_or_default, save_config,
-    set_active_model, update_active_model_profile,
+    Config, add_model_with_active_profile, apply_preset, config_path, ensure_model_catalog,
+    load_config_or_default, save_config, set_active_model, update_active_model_profile,
 };
 
 pub fn handle_config(command: ConfigCommand) -> Result<()> {
@@ -40,6 +40,7 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             auto_exec_trusted,
             history_max_messages,
             history_max_chars,
+            executor_model,
         } => {
             let mut cfg = load_config_or_default()?;
             if let Some(v) = model {
@@ -85,6 +86,15 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             }
             if let Some(v) = history_max_chars {
                 cfg.history_max_chars = v.max(2000);
+            }
+            if let Some(v) = executor_model {
+                let name = v.trim();
+                if name.is_empty() {
+                    cfg.executor_model = None;
+                } else {
+                    cfg.executor_model = Some(name.to_string());
+                    add_model_with_active_profile(&mut cfg, name);
+                }
             }
             ensure_model_catalog(&mut cfg);
             save_config(&cfg)?;

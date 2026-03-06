@@ -126,6 +126,9 @@ pub enum ConfigCommand {
         /// Maximum total chat characters kept before compaction
         #[arg(long)]
         history_max_chars: Option<usize>,
+        /// Optional executor model used as fallback when relay model fails to produce real diffs
+        #[arg(long)]
+        executor_model: Option<String>,
     },
 }
 

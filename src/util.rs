@@ -180,6 +180,148 @@ pub fn prefix_chars(text: &str, max_chars: usize) -> String {
     text[..cut_at].to_string()
 }
 
+pub fn render_markdown_terminal(text: &str, enabled: bool) -> String {
+    if !enabled {
+        return text.to_string();
+    }
+
+    let mut out = String::new();
+    let mut in_code_block = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim_start();
+
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            let lang = trimmed.trim_start_matches("```").trim();
+            if in_code_block {
+                if lang.is_empty() {
+                    out.push_str(&color_dim("┌ code"));
+                } else {
+                    out.push_str(&color_dim(&format!("┌ code ({lang})")));
+                }
+            } else {
+                out.push_str(&color_dim("└ end"));
+            }
+            out.push('\n');
+            continue;
+        }
+
+        if in_code_block {
+            out.push_str(&color_dim("│ "));
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some(h) = render_heading(trimmed) {
+            out.push_str(&h);
+            out.push('\n');
+            continue;
+        }
+        if let Some(q) = trimmed.strip_prefix(">") {
+            out.push_str(&color_dim("▏ "));
+            out.push_str(&style_inline_md(q.trim_start()));
+            out.push('\n');
+            continue;
+        }
+        if is_hr(trimmed) {
+            out.push_str(&color_dim("────────────────────────"));
+            out.push('\n');
+            continue;
+        }
+        if let Some(li) = render_list_item(trimmed) {
+            out.push_str(&li);
+            out.push('\n');
+            continue;
+        }
+
+        out.push_str(&style_inline_md(line));
+        out.push('\n');
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+fn render_heading(line: &str) -> Option<String> {
+    let mut level = 0usize;
+    for ch in line.chars() {
+        if ch == '#' {
+            level += 1;
+        } else {
+            break;
+        }
+    }
+    if level == 0 {
+        return None;
+    }
+    let text = line[level..].trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    let prefix = match level {
+        1 => "█ ",
+        2 => "▓ ",
+        3 => "▒ ",
+        _ => "▪ ",
+    };
+    Some(color_bold(&format!("{prefix}{}", style_inline_md(text))))
+}
+
+fn render_list_item(line: &str) -> Option<String> {
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return Some(format!("• {}", style_inline_md(rest)));
+    }
+
+    let mut idx = 0usize;
+    let bytes = line.as_bytes();
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > 0 && idx + 1 < bytes.len() && bytes[idx] == b'.' && bytes[idx + 1] == b' ' {
+        let rest = &line[idx + 2..];
+        return Some(format!("{}. {}", &line[..idx], style_inline_md(rest)));
+    }
+    None
+}
+
+fn is_hr(line: &str) -> bool {
+    let t = line.trim();
+    if t.len() < 3 {
+        return false;
+    }
+    t.chars().all(|c| c == '-' || c == '*' || c == '_')
+}
+
+fn style_inline_md(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code = false;
+    let mut buf = String::new();
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_code {
+                out.push_str(&color_cyan(&buf));
+                buf.clear();
+            } else {
+                out.push_str(&buf);
+                buf.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        buf.push(ch);
+    }
+    if in_code {
+        out.push_str(&color_cyan(&buf));
+    } else {
+        out.push_str(&buf);
+    }
+    out
+}
+
 // ── working-status spinner ───────────────────────────────────────────────────
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

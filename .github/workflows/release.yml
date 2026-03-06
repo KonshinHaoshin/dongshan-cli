@@ -49,8 +49,8 @@ jobs:
       - name: Generate checksums
         shell: pwsh
         run: |
-          Get-FileHash dist\dongshan-windows-x86_64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  dongshan-windows-x86_64.zip" } | Set-Content dist\SHA256SUMS.txt
-          Get-FileHash dist\dongshan-setup-windows-x86_64.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  dongshan-setup-windows-x86_64.exe" } | Add-Content dist\SHA256SUMS.txt
+          Get-FileHash dist\dongshan-windows-x86_64.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  dongshan-windows-x86_64.zip" } | Set-Content dist\SHA256SUMS-windows.txt
+          Get-FileHash dist\dongshan-setup-windows-x86_64.exe -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  dongshan-setup-windows-x86_64.exe" } | Add-Content dist\SHA256SUMS-windows.txt
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -58,5 +58,37 @@ jobs:
           files: |
             dist/dongshan-windows-x86_64.zip
             dist/dongshan-setup-windows-x86_64.exe
-            dist/SHA256SUMS.txt
+            dist/SHA256SUMS-windows.txt
+          generate_release_notes: true
+
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare dist assets
+        run: |
+          mkdir -p dist
+          cp target/release/dongshan dist/dongshan
+          chmod +x dist/dongshan
+          tar -C dist -czf dist/dongshan-linux-x86_64.tar.gz dongshan
+
+      - name: Generate checksums
+        run: |
+          sha256sum dist/dongshan-linux-x86_64.tar.gz > dist/SHA256SUMS-linux.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dongshan-linux-x86_64.tar.gz
+            dist/SHA256SUMS-linux.txt
           generate_release_notes: true

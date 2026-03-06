@@ -27,6 +27,12 @@
 cargo build --release
 ```
 
+Linux/macOS：
+
+```bash
+cargo build --release
+```
+
 ## 全局安装
 
 ```powershell
@@ -52,13 +58,28 @@ dongshan --help
 - 卸载时会删除开始菜单快捷方式
 - 安装器写入到 PATH 的 `{app}` 路径会自动清理
 
+## Linux 安装包
+
+Linux 用户推荐使用 Release 压缩包：
+
+- `dongshan-linux-x86_64.tar.gz`
+
+安装与运行：
+
+```bash
+tar -xzf dongshan-linux-x86_64.tar.gz
+chmod +x dongshan
+./dongshan --help
+```
+
 ## Release 自动打包
 
-仓库已内置 Windows 自动打包发布：
+仓库已内置 Windows + Linux 自动打包发布：
 
 - Workflow：`.github/workflows/release.yml`
 - Inno 安装脚本：`packaging/windows/dongshan.iss`
 - 本地打包脚本：`scripts/build-installer.ps1`
+- Linux 本地打包脚本：`scripts/build-linux-package.sh`
 
 发布新版本（打 tag）：
 
@@ -71,7 +92,9 @@ GitHub Actions 会自动上传：
 
 - `dongshan-setup-windows-x86_64.exe`
 - `dongshan-windows-x86_64.zip`
-- `SHA256SUMS.txt`
+- `SHA256SUMS-windows.txt`
+- `dongshan-linux-x86_64.tar.gz`
+- `SHA256SUMS-linux.txt`
 
 ## 快速开始
 
@@ -273,6 +296,33 @@ auto_exec_allow = ["rg", "ls"]
 auto_exec_deny = ["rm", "del"]
 auto_confirm_exec = true
 auto_exec_trusted = ["rg", "grep", "git status"]
+```
+
+## 执行器模型路由
+
+Dongshan 支持工具执行的自动模型路由。配置 `executor_model` 来处理文件操作，同时使用更快的模型进行对话：
+
+```toml
+model = "grok-4.1-fast"  # 快速对话模型
+executor_model = "grok-4-1-fast-non-reasoning"  # 可靠的工具执行模型
+```
+
+工作原理：
+- **对话/解释**：使用主模型 `model`（快速且便宜）
+- **文件操作**：需要工具时自动路由到 `executor_model`
+- **自动检测**：Agent 模式检测文件操作关键词并自动切换
+
+触发 agent 模式的关键词：
+- 英文：`create`, `write`, `modify`, `edit`, `update`, `implement`, `fix`, `patch`
+- 中文：`创建`, `写`, `修改`, `编辑`, `更新`, `实现`, `修复`, `补丁`, `添加`, `生成`, `保存`
+
+示例工作流：
+```powershell
+# 用户："添加一个处理认证的新功能"
+# → 检测到"添加"关键词
+# → 切换到 agent 模式
+# → 工具调用路由到 executor_model
+# → 使用 grok-4-1-fast-non-reasoning 执行文件写入
 ```
 
 ## 模型命令

@@ -96,6 +96,8 @@ pub struct Config {
     pub history_max_chars: usize,
     #[serde(default)]
     pub model_catalog: Vec<String>,
+    #[serde(default)]
+    pub executor_model: Option<String>,
 }
 
 impl Default for Config {
@@ -132,6 +134,7 @@ impl Default for Config {
             history_max_messages: default_history_max_messages(),
             history_max_chars: default_history_max_chars(),
             model_catalog: vec![model],
+            executor_model: None,
         }
     }
 }

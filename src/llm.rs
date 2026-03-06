@@ -31,6 +31,9 @@ pub struct NativeLlmResponse {
 pub fn build_openai_messages(system_prompt: &str, history: &[ChatMessage]) -> Vec<Value> {
     let mut messages = vec![json!({"role":"system","content":system_prompt})];
     for m in history {
+        if m.content.trim().is_empty() {
+            continue;
+        }
         messages.push(json!({"role": m.role, "content": m.content}));
     }
     messages
@@ -49,7 +52,7 @@ pub async fn call_llm_with_history(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Result<String> {
-    call_llm_with_history_impl(cfg, system_prompt, history, false).await
+    call_llm_with_history_impl(cfg, system_prompt, history, false, None).await
 }
 
 pub async fn call_llm_with_history_stream(
@@ -57,7 +60,29 @@ pub async fn call_llm_with_history_stream(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Result<String> {
-    call_llm_with_history_impl(cfg, system_prompt, history, true).await
+    call_llm_with_history_impl(cfg, system_prompt, history, true, None).await
+}
+
+pub async fn call_llm_with_history_stream_tools(
+    cfg: &Config,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[Value],
+) -> Result<String> {
+    // 如果配置了 executor_model，用它来处理工具调用
+    if let Some(executor_model) = &cfg.executor_model {
+        let mut executor_cfg = cfg.clone();
+        executor_cfg.model = executor_model.clone();
+        // 从 model_profiles 中获取对应配置
+        if let Some(profile) = cfg.model_profiles.get(executor_model) {
+            executor_cfg.base_url = profile.base_url.clone();
+            executor_cfg.api_key_env = profile.api_key_env.clone();
+            executor_cfg.api_key = profile.api_key.clone();
+        }
+        call_llm_with_history_impl(&executor_cfg, system_prompt, history, true, Some(tools)).await
+    } else {
+        call_llm_with_history_impl(cfg, system_prompt, history, true, Some(tools)).await
+    }
 }
 
 async fn call_llm_with_history_impl(
@@ -65,6 +90,7 @@ async fn call_llm_with_history_impl(
     system_prompt: &str,
     history: &[ChatMessage],
     stream_output: bool,
+    tools: Option<&[Value]>,
 ) -> Result<String> {
     let working = if stream_output {
         None
@@ -73,12 +99,17 @@ async fn call_llm_with_history_impl(
     };
     let api_key = resolve_api_key(cfg)?;
     let messages = build_openai_messages(system_prompt, history);
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model,
         "messages": messages,
         "temperature": 0.2,
         "stream": stream_output
     });
+
+    if let Some(tools) = tools {
+        body["tools"] = json!(tools);
+        body["tool_choice"] = json!("auto");
+    }
 
     let timeout_secs = if stream_output { 900 } else { 120 };
     let client = Client::builder()
@@ -108,7 +139,9 @@ async fn call_llm_with_history_impl(
         .to_string();
 
     let out = if stream_output && content_type.contains("text/event-stream") {
-        parse_sse_response(resp, true).await?
+        // Keep stream transport but avoid raw token-by-token stdout output;
+        // terminal markdown rendering is handled by chat layer after full response.
+        parse_sse_response(resp, false).await?
     } else {
         let text = resp.text().await.context("Failed to read response body")?;
         let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
@@ -126,9 +159,23 @@ pub async fn call_llm_with_messages_native_tools(
     messages: &[Value],
     tools: &[Value],
 ) -> Result<NativeLlmResponse> {
-    let api_key = resolve_api_key(cfg)?;
+    // 如果配置了 executor_model，用它来处理工具调用
+    let executor_cfg = if let Some(executor_model) = &cfg.executor_model {
+        let mut exec_cfg = cfg.clone();
+        exec_cfg.model = executor_model.clone();
+        if let Some(profile) = cfg.model_profiles.get(executor_model) {
+            exec_cfg.base_url = profile.base_url.clone();
+            exec_cfg.api_key_env = profile.api_key_env.clone();
+            exec_cfg.api_key = profile.api_key.clone();
+        }
+        exec_cfg
+    } else {
+        cfg.clone()
+    };
+
+    let api_key = resolve_api_key(&executor_cfg)?;
     let body = json!({
-        "model": cfg.model,
+        "model": executor_cfg.model,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
@@ -142,12 +189,12 @@ pub async fn call_llm_with_messages_native_tools(
         .context("failed to build HTTP client")?;
 
     let resp = client
-        .post(&cfg.base_url)
+        .post(&executor_cfg.base_url)
         .bearer_auth(api_key)
         .json(&body)
         .send()
         .await
-        .with_context(|| format!("Request failed: {}", cfg.base_url))?;
+        .with_context(|| format!("Request failed: {}", executor_cfg.base_url))?;
 
     let status = resp.status();
     if !status.is_success() {
