@@ -7,15 +7,19 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::config::{
-    AutoExecMode, Config, ProviderPreset, add_model_with_active_profile, apply_preset, config_path,
-    load_config_or_default, provider_model_options, save_config, set_active_model,
-    update_active_model_profile,
+    AutoExecMode, Config, ModelApiProvider, ProviderPreset, add_model_with_active_profile,
+    apply_preset, config_path, load_config_or_default, provider_model_options, save_config,
+    set_active_model, update_active_model_profile, upsert_model_profile,
 };
 use crate::prompt_store::{list_prompt_names, save_prompt};
 use crate::util::{ask, tagged_prompt};
 
 pub async fn run_onboard() -> Result<()> {
     let mut cfg = load_config_or_default()?;
+    let mut custom_provider: Option<ModelApiProvider> = None;
+    let mut custom_base_url: Option<String> = None;
+    let mut custom_api_key_env: Option<String> = None;
+    let mut entered_api_key: Option<String> = None;
 
     println!("== dongshan onboard ==");
     println!("Config file: {}", config_path()?.display());
@@ -26,73 +30,147 @@ pub async fn run_onboard() -> Result<()> {
     println!("3) openrouter");
     println!("4) xai");
     println!("5) nvidia");
+    println!("6) custom configuration");
     let provider_input = ask(&tagged_prompt(
         "onboard",
-        "Provider [1=openai/2=deepseek/3=openrouter/4=xai/5=nvidia] (default 1): ",
+        "Provider [1=openai/2=deepseek/3=openrouter/4=xai/5=nvidia/6=custom] (default 1): ",
     ))?;
-    let preset = match provider_input.trim() {
-        "2" | "deepseek" => ProviderPreset::Deepseek,
-        "3" | "openrouter" => ProviderPreset::Openrouter,
-        "4" | "xai" => ProviderPreset::Xai,
-        "5" | "nvidia" => ProviderPreset::Nvidia,
-        _ => ProviderPreset::Openai,
+    let selected_preset = match provider_input.trim() {
+        "2" | "deepseek" => {
+            apply_preset(&mut cfg, ProviderPreset::Deepseek);
+            Some(ProviderPreset::Deepseek)
+        }
+        "3" | "openrouter" => {
+            apply_preset(&mut cfg, ProviderPreset::Openrouter);
+            Some(ProviderPreset::Openrouter)
+        }
+        "4" | "xai" => {
+            apply_preset(&mut cfg, ProviderPreset::Xai);
+            Some(ProviderPreset::Xai)
+        }
+        "5" | "nvidia" => {
+            apply_preset(&mut cfg, ProviderPreset::Nvidia);
+            Some(ProviderPreset::Nvidia)
+        }
+        "6" | "custom" => {
+            let provider_kind_input = ask(&tagged_prompt(
+                "onboard",
+                "Custom provider [openai/at] (default openai): ",
+            ))?;
+            let provider_kind = match provider_kind_input.trim().to_lowercase().as_str() {
+                "at" | "2" => ModelApiProvider::At,
+                _ => ModelApiProvider::Openai,
+            };
+            custom_provider = Some(provider_kind);
+
+            let base_url = ask(&tagged_prompt(
+                "onboard",
+                &format!("API base URL (default {}): ", cfg.base_url),
+            ))?;
+            if !base_url.trim().is_empty() {
+                cfg.base_url = base_url.trim().to_string();
+            }
+            custom_base_url = Some(cfg.base_url.clone());
+
+            let api_key_env = ask(&tagged_prompt(
+                "onboard",
+                &format!("API key env var (default {}): ", cfg.api_key_env),
+            ))?;
+            if !api_key_env.trim().is_empty() {
+                cfg.api_key_env = api_key_env.trim().to_string();
+            }
+            custom_api_key_env = Some(cfg.api_key_env.clone());
+            None
+        }
+        _ => {
+            apply_preset(&mut cfg, ProviderPreset::Openai);
+            Some(ProviderPreset::Openai)
+        }
     };
-    apply_preset(&mut cfg, preset);
 
     let key = ask(&tagged_prompt(
         "onboard",
         "API key (leave empty to keep existing): ",
     ))?;
     if !key.trim().is_empty() {
-        cfg.api_key = Some(key.trim().to_string());
+        entered_api_key = Some(key.trim().to_string());
+        cfg.api_key = entered_api_key.clone();
     }
 
-    let mut model_options = provider_model_options(preset)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let selected_model = if let Some(preset) = selected_preset {
+        let mut model_options = provider_model_options(preset)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
 
-    if let Some(online) = fetch_provider_models_online(preset, &cfg).await? {
-        model_options = merge_unique(model_options, online);
-        println!("Fetched online model list.");
+        if let Some(online) = fetch_provider_models_online(preset, &cfg).await? {
+            model_options = merge_unique(model_options, online);
+            println!("Fetched online model list.");
+        } else {
+            println!("Online model list unavailable, using built-in suggestions.");
+        }
+
+        println!("\nChoose model:");
+        for (idx, m) in model_options.iter().enumerate() {
+            println!("{}) {}", idx + 1, m);
+        }
+        println!("0) custom input");
+        let model_choice = ask(&tagged_prompt(
+            "onboard",
+            &format!(
+                "Model option [0=custom..{}] (default 1): ",
+                model_options.len()
+            ),
+        ))?;
+        let choice_num = model_choice.trim().parse::<usize>().unwrap_or(1);
+        if choice_num == 0 {
+            let model = ask(&tagged_prompt(
+                "onboard",
+                &format!("Model (default {}): ", cfg.model),
+            ))?;
+            if !model.trim().is_empty() {
+                model.trim().to_string()
+            } else {
+                cfg.model.clone()
+            }
+        } else if choice_num <= model_options.len() {
+            model_options[choice_num - 1].to_string()
+        } else {
+            cfg.model.clone()
+        }
     } else {
-        println!("Online model list unavailable, using built-in suggestions.");
-    }
-
-    println!("\nChoose model:");
-    for (idx, m) in model_options.iter().enumerate() {
-        println!("{}) {}", idx + 1, m);
-    }
-    println!("0) custom input");
-    let model_choice = ask(&tagged_prompt(
-        "onboard",
-        &format!("Model option [0=custom..{}] (default 1): ", model_options.len()),
-    ))?;
-    let choice_num = model_choice.trim().parse::<usize>().unwrap_or(1);
-    let selected_model = if choice_num == 0 {
         let model = ask(&tagged_prompt(
             "onboard",
-            &format!("Model (default {}): ", cfg.model),
+            &format!("Model name (default {}): ", cfg.model),
         ))?;
         if !model.trim().is_empty() {
             model.trim().to_string()
         } else {
             cfg.model.clone()
         }
-    } else if choice_num <= model_options.len() {
-        model_options[choice_num - 1].to_string()
-    } else {
-        cfg.model.clone()
     };
     set_active_model(&mut cfg, &selected_model);
     add_model_with_active_profile(&mut cfg, &selected_model);
     update_active_model_profile(&mut cfg);
+    if let Some(provider) = custom_provider {
+        upsert_model_profile(
+            &mut cfg,
+            &selected_model,
+            custom_base_url,
+            custom_api_key_env,
+            entered_api_key,
+            Some(provider),
+        );
+    }
 
     let nsfw = ask(&tagged_prompt(
         "confirm",
         "Allow NSFW in dongshan local prompt flow? [y=allow]/[n=disallow] (default y): ",
     ))?;
-    if matches!(nsfw.trim().to_lowercase().as_str(), "n" | "no" | "0" | "false") {
+    if matches!(
+        nsfw.trim().to_lowercase().as_str(),
+        "n" | "no" | "0" | "false"
+    ) {
         cfg.allow_nsfw = false;
     } else if !nsfw.trim().is_empty() {
         cfg.allow_nsfw = true;
@@ -114,10 +192,7 @@ pub async fn run_onboard() -> Result<()> {
 
     println!("\nPrompt profile name to use (default):");
     let prompt_names = list_prompt_names().unwrap_or_else(|_| vec!["default".to_string()]);
-    println!(
-        "Existing: {}",
-        prompt_names.join(", ")
-    );
+    println!("Existing: {}", prompt_names.join(", "));
     let active_name = ask(&tagged_prompt(
         "onboard",
         &format!("Active prompt name (default {}): ", cfg.active_prompt),
@@ -125,7 +200,10 @@ pub async fn run_onboard() -> Result<()> {
     if !active_name.trim().is_empty() {
         let name = active_name.trim().to_string();
         if !prompt_names.iter().any(|p| p == &name) {
-            let text = ask(&tagged_prompt("onboard", &format!("Prompt '{}' text: ", name)))?;
+            let text = ask(&tagged_prompt(
+                "onboard",
+                &format!("Prompt '{}' text: ", name),
+            ))?;
             if text.trim().is_empty() {
                 bail!("Prompt text cannot be empty for new prompt '{}'", name);
             }
@@ -155,7 +233,10 @@ fn merge_unique(base: Vec<String>, extra: Vec<String>) -> Vec<String> {
     out
 }
 
-async fn fetch_provider_models_online(provider: ProviderPreset, cfg: &Config) -> Result<Option<Vec<String>>> {
+async fn fetch_provider_models_online(
+    provider: ProviderPreset,
+    cfg: &Config,
+) -> Result<Option<Vec<String>>> {
     let client = Client::builder().timeout(Duration::from_secs(6)).build()?;
     let (url, needs_auth) = match provider {
         ProviderPreset::Openrouter => ("https://openrouter.ai/api/v1/models".to_string(), false),
@@ -165,9 +246,7 @@ async fn fetch_provider_models_online(provider: ProviderPreset, cfg: &Config) ->
     let mut req = client
         .get(url)
         .header("User-Agent", "dongshan-onboard-model-fetch");
-    if needs_auth
-        && let Some(k) = resolve_api_key_optional(cfg)
-    {
+    if needs_auth && let Some(k) = resolve_api_key_optional(cfg) {
         req = req.bearer_auth(k);
     }
 

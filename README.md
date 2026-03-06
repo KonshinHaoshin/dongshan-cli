@@ -30,6 +30,12 @@
 cargo build --release
 ```
 
+Linux/macOS:
+
+```bash
+cargo build --release
+```
+
 ## Global Install
 
 ```powershell
@@ -62,13 +68,28 @@ Uninstall behavior:
 - Start Menu shortcuts are removed by uninstaller
 - Installer-added `{app}` PATH entry is automatically cleaned on uninstall
 
+## Linux Package
+
+For Linux users, use release tarball:
+
+- `dongshan-linux-x86_64.tar.gz`
+
+Install and run:
+
+```bash
+tar -xzf dongshan-linux-x86_64.tar.gz
+chmod +x dongshan
+./dongshan --help
+```
+
 ## Release Packaging
 
-This repo includes automated packaging for Windows setup:
+This repo includes automated packaging for Windows and Linux:
 
 - Workflow: `.github/workflows/release.yml`
 - Inno script: `packaging/windows/dongshan.iss`
 - Local build script: `scripts/build-installer.ps1`
+- Local Linux package script: `scripts/build-linux-package.sh`
 
 Publish a new release by pushing a tag:
 
@@ -81,7 +102,9 @@ GitHub Actions will build and upload:
 
 - `dongshan-setup-windows-x86_64.exe`
 - `dongshan-windows-x86_64.zip`
-- `SHA256SUMS.txt`
+- `SHA256SUMS-windows.txt`
+- `dongshan-linux-x86_64.tar.gz`
+- `SHA256SUMS-linux.txt`
 
 ## Quick Start
 
@@ -291,6 +314,33 @@ edit = "Keep changes minimal and preserve behavior unless requested."
 
 [prompt_vars]
 tone = "strict"
+```
+
+## Executor Model Routing
+
+Dongshan supports automatic model routing for tool execution. Configure an `executor_model` to handle file operations while using a faster model for conversation:
+
+```toml
+model = "grok-4.1-fast"  # Fast model for chat
+executor_model = "grok-4-1-fast-non-reasoning"  # Reliable model for tool calls
+```
+
+How it works:
+- **Chat/explanation**: Uses your main `model` (fast and cheap)
+- **File operations**: Automatically routes to `executor_model` when tools are needed
+- **Auto-detection**: Agent mode detects file operation keywords and switches automatically
+
+Keywords that trigger agent mode:
+- English: `create`, `write`, `modify`, `edit`, `update`, `implement`, `fix`, `patch`
+- Chinese: `创建`, `写`, `修改`, `编辑`, `更新`, `实现`, `修复`, `补丁`
+
+Example workflow:
+```powershell
+# User: "Add a new feature to handle authentication"
+# → Detects "add" keyword
+# → Switches to agent mode
+# → Routes tool calls to executor_model
+# → Uses grok-4-1-fast-non-reasoning for file writes
 ```
 
 ## Models Command

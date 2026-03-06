@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -18,6 +18,29 @@ pub enum ProviderPreset {
     Nvidia,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelApiProvider {
+    Openai,
+    At,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallMode {
+    Auto,
+    Native,
+    Json,
+}
+
+fn default_model_provider() -> ModelApiProvider {
+    ModelApiProvider::Openai
+}
+
+fn default_tool_call_mode() -> ToolCallMode {
+    ToolCallMode::Auto
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoExecMode {
@@ -28,6 +51,10 @@ pub enum AutoExecMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
+    #[serde(default = "default_model_provider")]
+    pub provider: ModelApiProvider,
+    #[serde(default = "default_tool_call_mode")]
+    pub tool_mode: ToolCallMode,
     pub base_url: String,
     pub api_key_env: String,
     #[serde(default)]
@@ -69,6 +96,8 @@ pub struct Config {
     pub history_max_chars: usize,
     #[serde(default)]
     pub model_catalog: Vec<String>,
+    #[serde(default)]
+    pub executor_model: Option<String>,
 }
 
 impl Default for Config {
@@ -78,6 +107,8 @@ impl Default for Config {
         model_profiles.insert(
             model.clone(),
             ModelProfile {
+                provider: ModelApiProvider::Openai,
+                tool_mode: ToolCallMode::Auto,
                 base_url: base_url.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
@@ -103,6 +134,7 @@ impl Default for Config {
             history_max_messages: default_history_max_messages(),
             history_max_chars: default_history_max_chars(),
             model_catalog: vec![model],
+            executor_model: None,
         }
     }
 }
@@ -193,6 +225,8 @@ pub fn apply_preset(cfg: &mut Config, provider: ProviderPreset) {
     cfg.model_profiles.insert(
         model.clone(),
         ModelProfile {
+            provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url,
             api_key_env,
             api_key: cfg.api_key.clone(),
@@ -279,6 +313,16 @@ pub fn save_config(cfg: &Config) -> Result<()> {
 
 pub fn ensure_model_catalog(cfg: &mut Config) {
     let fallback = ModelProfile {
+        provider: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.provider)
+            .unwrap_or(ModelApiProvider::Openai),
+        tool_mode: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.tool_mode)
+            .unwrap_or(ToolCallMode::Auto),
         base_url: cfg.base_url.clone(),
         api_key_env: cfg.api_key_env.clone(),
         api_key: cfg.api_key.clone(),
@@ -339,6 +383,16 @@ pub fn update_active_model_profile(cfg: &mut Config) {
     cfg.model_profiles.insert(
         cfg.model.clone(),
         ModelProfile {
+            provider: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.provider)
+                .unwrap_or(ModelApiProvider::Openai),
+            tool_mode: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.tool_mode)
+                .unwrap_or(ToolCallMode::Auto),
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -370,6 +424,8 @@ pub fn add_model_with_active_profile(cfg: &mut Config, model: &str) {
         .get(&cfg.model)
         .cloned()
         .unwrap_or(ModelProfile {
+            provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -399,6 +455,7 @@ pub fn upsert_model_profile(
     base_url: Option<String>,
     api_key_env: Option<String>,
     api_key: Option<String>,
+    provider: Option<ModelApiProvider>,
 ) {
     let name = model.trim();
     if name.is_empty() {
@@ -411,11 +468,16 @@ pub fn upsert_model_profile(
         .get(name)
         .cloned()
         .unwrap_or(ModelProfile {
+            provider: ModelApiProvider::Openai,
+            tool_mode: ToolCallMode::Auto,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
         });
 
+    if let Some(v) = provider {
+        p.provider = v;
+    }
     if let Some(v) = base_url
         && !v.trim().is_empty()
     {
@@ -471,6 +533,34 @@ pub fn resolve_api_key(cfg: &Config) -> Result<String> {
     )
 }
 
+pub fn effective_tool_mode(cfg: &Config, model: &str) -> ToolCallMode {
+    let Some(p) = cfg.model_profiles.get(model) else {
+        return ToolCallMode::Native;
+    };
+    match p.tool_mode {
+        ToolCallMode::Auto => match p.provider {
+            ModelApiProvider::At => ToolCallMode::Json,
+            ModelApiProvider::Openai => ToolCallMode::Native,
+        },
+        v => v,
+    }
+}
+
+pub fn active_effective_tool_mode(cfg: &Config) -> ToolCallMode {
+    effective_tool_mode(cfg, &cfg.model)
+}
+
+pub fn set_model_tool_mode(cfg: &mut Config, model: &str, mode: ToolCallMode) {
+    let name = model.trim();
+    if name.is_empty() {
+        return;
+    }
+    ensure_model_catalog(cfg);
+    if let Some(p) = cfg.model_profiles.get_mut(name) {
+        p.tool_mode = mode;
+    }
+}
+
 pub fn render_prompt_vars(input: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = input.to_string();
     for (k, v) in vars {
@@ -498,20 +588,36 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nAnswer directly in natural language.");
     } else if mode == "chat" {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
-        prompt.push_str("\nWork as an agent in this loop: understand task -> inspect code -> edit -> verify -> summarize.");
+        prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
-        prompt.push_str("\nAfter tool outputs, decide either next tool call or final answer; avoid redundant steps.");
-        prompt.push_str("\nIf terminal execution is needed, output structured JSON tool calls only.");
+        match active_effective_tool_mode(cfg) {
+            ToolCallMode::Json => {
+                prompt.push_str("\nTool protocol mode: json.");
+                prompt.push_str("\nDo not use native function-calling.");
+                prompt.push_str("\nWhen execution is needed, output only strict JSON object: {\"tool_calls\":[...]}.");
+                prompt.push_str("\nNo markdown fences. No prose around JSON.");
+                prompt.push_str("\nIf no execution is needed, output final answer directly.");
+            }
+            _ => {
+                prompt.push_str("\nUse OpenAI native function-calling first; use shell only when native fs functions are insufficient.");
+                prompt.push_str("\nIf function-calling is unavailable, fallback to strict JSON tool_calls. Never use markdown shell blocks.");
+            }
+        }
+        prompt.push_str("\nSupported tools:");
+        prompt.push_str("\n- fs_read_file args: {path}");
+        prompt.push_str("\n- fs_create_file args: {path, content, overwrite?}");
+        prompt.push_str("\n- fs_edit_file args: {path, old_str, new_str, replace_all?}");
         prompt.push_str(
-            "\nFormat: ```json {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"rg --files\"}]} ```",
+            "\n- fs_apply_patch args: {path, edits:[{old|old_str,new|new_str,replace_all?}...]}",
         );
-        prompt.push_str("\nDo not output bash/powershell/python command blocks for auto execution.");
-        prompt.push_str("\nKeep tool_calls commands short and robust; avoid long base64 payloads.");
-        prompt.push_str("\nAvoid multiline python -c and complex quote escaping on Windows PowerShell.");
-        prompt.push_str("\nFor file edits, prefer creating a small script file first, then executing it in a second command.");
-        prompt.push_str("\nStable write workflow (Windows preferred): step1 write script with PowerShell here-string -> step2 run script -> step3 verify file content with type/Get-Content.");
-        prompt.push_str("\nExample step1: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"$py = @\'...\'@; Set-Content -Encoding utf8 systems_gen.py $py\"}]}");
-        prompt.push_str("\nExample step2: {\"tool_calls\":[{\"tool\":\"shell\",\"command\":\"python systems_gen.py\"}]}");
+        prompt.push_str("\n- fs_list_files args: {path?}");
+        prompt.push_str("\n- fs_grep args: {pattern, path?}");
+        prompt.push_str("\n- fs_move args: {from, to}");
+        prompt.push_str("\n- fs_delete args: {path, recursive?}");
+        prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
+        prompt.push_str("\n- shell args: {command} (legacy fallback)");
+        prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs_read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
+        prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");
     }
     if cfg.allow_nsfw {
         prompt.push_str(

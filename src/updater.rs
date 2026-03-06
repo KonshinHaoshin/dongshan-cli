@@ -159,7 +159,8 @@ fn load_state() -> Result<UpdateState> {
     if !path.exists() {
         return Ok(UpdateState::default());
     }
-    let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
     let s: UpdateState =
         serde_json::from_str(&text).with_context(|| format!("Invalid {}", path.display()))?;
     Ok(s)
