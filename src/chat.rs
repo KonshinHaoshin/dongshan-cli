@@ -31,6 +31,10 @@ use crate::llm::{
     call_llm_with_history_stream_tools, call_llm_with_messages_native_tools,
 };
 use crate::prompt_store::list_prompt_names;
+use crate::skills::{
+    find_skill, load_active_skill_for_session, load_skills, pick_skill_for_input,
+    runtime_active_skill, save_active_skill_for_session, set_runtime_active_skill,
+};
 use crate::util::{
     WorkingStatus, ask, ask_or_eof, color_blue, color_cyan, color_dim, color_green, color_red,
     color_rust, color_yellow, prefix_chars, print_startup_banner, render_markdown_terminal, tagged_prompt,
@@ -48,6 +52,14 @@ const MAX_FS_SNAPSHOT_HASH_BYTES: u64 = 1_000_000;
 const STRICT_TOOL_CALL_INSTRUCTION: &str = "You must execute using strict JSON tool_calls only. Allowed format example: {\"tool_calls\":[{\"tool\":\"fs_create_file\",\"args\":{\"path\":\"analysis.md\",\"content\":\"...\"}}]}. Do not output <think>, code_execution, or markdown code fences.";
 const WRITE_TASK_RETRY_MSG: &str = "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result. Use strict JSON tool_calls only.";
 const WRITE_CLAIM_RETRY_MSG: &str = "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute required tool_calls to create/update the target file using strict JSON only.";
+
+fn user_visible_write_fail() -> &'static str {
+    "No real file changes were applied."
+}
+
+fn user_visible_manual_delegation() -> &'static str {
+    "This reply only described manual edits; it did not modify files."
+}
 
 #[derive(Default, Clone)]
 struct DiffPreviewCache {
@@ -96,6 +108,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
     let mut active_session = resolve_session_name(session)?;
     let mut exec_mode = ChatExecutionMode::AgentAuto;
     let mut render_markdown = true;
+    let mut active_skill = load_active_skill_for_session(&active_session)?;
     print_startup_banner(&active_session, &cfg.model, exec_mode.as_str());
     let mut history = load_session_or_default(&active_session)?;
     loop {
@@ -119,6 +132,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut active_session,
                 &mut exec_mode,
                 &mut render_markdown,
+                &mut active_skill,
             )
             .await?;
             save_session(&active_session, &history)?;
@@ -126,11 +140,20 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
             continue;
         }
 
+        let turn_skill = match active_skill.as_deref() {
+            Some(name) => find_skill(name)?,
+            None => pick_skill_for_input(input.trim())?,
+        };
+        if active_skill.is_none() && let Some(skill) = &turn_skill {
+            println!("assistant> Activated skill: {}", skill.manifest.name);
+        }
+
         if handle_natural_language_tool_command(
             input.trim(),
             &mut cfg,
             &mut history,
             render_markdown,
+            turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
         )
         .await?
         {
@@ -161,10 +184,18 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 "chat",
                 Some(&active_session),
                 render_markdown,
+                turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
             )
             .await?;
         } else {
-            run_chat_turn(&mut cfg, &mut history, "chat-lite", render_markdown).await?;
+            run_chat_turn(
+                &mut cfg,
+                &mut history,
+                "chat-lite",
+                render_markdown,
+                turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+            )
+            .await?;
         }
         save_session(&active_session, &history)?;
         print_changed_files_delta(&changed_before)?;
@@ -178,6 +209,7 @@ async fn handle_natural_language_tool_command(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<bool> {
     let lower = input.to_lowercase();
 
@@ -251,28 +283,36 @@ async fn handle_natural_language_tool_command(
         return Ok(true);
     }
 
-    if let Some(path) = extract_existing_file_path(input) {
-        if !is_read_request(input, &lower)
-            && !is_list_request(input, &lower)
-            && !is_grep_request(input, &lower)
-        {
-            submit_file_to_model(cfg, history, input, &path, render_markdown).await?;
-            return Ok(true);
-        }
+    if let Some(path) = extract_existing_file_path(input)
+        && should_auto_inspect_path(input, &lower)
+        && !is_list_request(input, &lower)
+        && !is_grep_request(input, &lower)
+    {
+        inspect_path_reference(
+            cfg,
+            history,
+            input,
+            &path,
+            render_markdown,
+            active_skill,
+            has_followup_analysis_intent(input, &lower),
+        )
+        .await?;
+        return Ok(true);
     }
 
     if is_read_request(input, &lower) {
         if let Some(path) = extract_path(input) {
-            if has_followup_analysis_intent(input, &lower) {
-                submit_file_to_model(cfg, history, input, &path, render_markdown).await?;
-            } else {
-                let content = read_text_file(Path::new(&path))?;
-                push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
-                println!(
-                    "Read {} (content hidden). Ask a follow-up question to analyze it.",
-                    path
-                );
-            }
+            inspect_path_reference(
+                cfg,
+                history,
+                input,
+                &path,
+                render_markdown,
+                active_skill,
+                has_followup_analysis_intent(input, &lower),
+            )
+            .await?;
             return Ok(true);
         }
     }
@@ -303,12 +343,53 @@ async fn handle_natural_language_tool_command(
     Ok(false)
 }
 
+async fn inspect_path_reference(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    user_input: &str,
+    path: &str,
+    render_markdown: bool,
+    active_skill: Option<&str>,
+    analyze: bool,
+) -> Result<()> {
+    let target = Path::new(path);
+    if !target.exists() {
+        println!("Path not found: {}", path);
+        push_tool_result(history, user_input, "fs.path", &format!("Path not found: {}", path));
+        return Ok(());
+    }
+    if target.is_dir() {
+        let out = list_files_output(target)?;
+        print!("{out}");
+        push_tool_result(history, user_input, "fs.list", &clip_output(&out, 8000));
+        return Ok(());
+    }
+    if is_probably_binary_file(target) {
+        let summary = describe_path_metadata(target)?;
+        println!("{}", summary);
+        push_tool_result(history, user_input, "fs.stat", &summary);
+        return Ok(());
+    }
+    if analyze {
+        submit_file_to_model(cfg, history, user_input, path, render_markdown, active_skill).await?;
+        return Ok(());
+    }
+    let content = read_text_file(target)?;
+    push_tool_result(history, user_input, "fs.read", &clip_output(&content, 8000));
+    println!(
+        "Read {} (content hidden). Ask a follow-up question to analyze it.",
+        path
+    );
+    Ok(())
+}
+
 async fn submit_file_to_model(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     user_request: &str,
     path: &str,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
     let content = read_text_file(Path::new(path))?;
     let ext = Path::new(path)
@@ -328,7 +409,7 @@ async fn submit_file_to_model(
         content: prompt,
     });
     maybe_compact_history(history, cfg);
-    let system = build_system_prompt(cfg, "review");
+    let system = build_system_prompt_with_skill(cfg, "review", active_skill)?;
     run_agent_turn_with_system(cfg, history, &system, None, render_markdown, false).await
 }
 
@@ -609,6 +690,74 @@ fn extract_existing_file_path(input: &str) -> Option<String> {
     None
 }
 
+fn should_auto_inspect_path(input: &str, lower: &str) -> bool {
+    is_read_request(input, lower)
+        || lower.contains("analyze ")
+        || lower.contains("open ")
+        || lower.contains("check ")
+        || input.contains("分析")
+        || input.contains("读取")
+        || input.contains("查看")
+        || input.contains("打开")
+        || input.contains("检查")
+        || input.contains("看看")
+}
+
+fn is_probably_binary_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "ttf"
+            | "otf"
+            | "woff"
+            | "woff2"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "pdf"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "7z"
+            | "dll"
+            | "exe"
+            | "so"
+            | "bin"
+    ) {
+        return true;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes.iter().take(512).any(|b| *b == 0)
+}
+
+fn describe_path_metadata(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata {}", path.display()))?;
+    let kind = if meta.is_dir() { "directory" } else { "binary or non-text file" };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "{}: {}\nsize: {} bytes\nmodified_unix: {}",
+        kind,
+        path.display(),
+        meta.len(),
+        modified
+    ))
+}
+
 fn extract_quoted(input: &str) -> Option<String> {
     let start = input.find('"').or_else(|| input.find('\''))?;
     let quote = input.chars().nth(start)?;
@@ -628,6 +777,46 @@ fn first_token(s: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
 }
 
+fn build_system_prompt_with_skill(
+    cfg: &Config,
+    mode: &str,
+    active_skill: Option<&str>,
+) -> Result<String> {
+    let mut prompt = build_system_prompt(cfg, mode);
+    let Some(name) = active_skill.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(prompt);
+    };
+    if let Some(skill) = find_skill(name)? {
+        prompt.push_str("\nActive skill:");
+        prompt.push_str(&format!("\n- name: {}", skill.manifest.name));
+        if !skill.manifest.description.trim().is_empty() {
+            prompt.push_str(&format!("\n- description: {}", skill.manifest.description));
+        }
+        if !skill.manifest.allowed_tools.is_empty() {
+            prompt.push_str(&format!(
+                "\n- preferred_tools: {}",
+                skill.manifest.allowed_tools.join(", ")
+            ));
+        }
+        if !skill.manifest.trusted_commands.is_empty() {
+            prompt.push_str(&format!(
+                "\n- trusted_commands: {}",
+                skill.manifest.trusted_commands.join(", ")
+            ));
+        }
+        if !skill.prompt_text.trim().is_empty() {
+            prompt.push_str("\nSkill instructions:\n");
+            prompt.push_str(&skill.prompt_text);
+        }
+    } else {
+        prompt.push_str(&format!(
+            "\nRequested active skill '{}' was not found. Continue without it.",
+            name
+        ));
+    }
+    Ok(prompt)
+}
+
 async fn handle_chat_slash_command(
     input: &str,
     cfg: &mut Config,
@@ -635,6 +824,7 @@ async fn handle_chat_slash_command(
     active_session: &mut String,
     exec_mode: &mut ChatExecutionMode,
     render_markdown: &mut bool,
+    active_skill: &mut Option<String>,
 ) -> Result<()> {
     let mut parts = input.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -670,6 +860,7 @@ async fn handle_chat_slash_command(
             c("/prompt use <name>", "switch prompt");
             c("/model list", "list available models");
             c("/model use <name>", "switch model");
+            c("/skill list|show|use|clear", "manage session skill");
             println!(
                 "{}",
                 color_dim("─────────────────────────────────────────────")
@@ -721,6 +912,7 @@ async fn handle_chat_slash_command(
                     let next_history = load_session_or_default(&next_session)?;
                     *history = next_history;
                     *active_session = next_session.clone();
+                    *active_skill = load_active_skill_for_session(&next_session)?;
                     println!(
                         "Switched session: {} ({} messages)",
                         next_session,
@@ -776,24 +968,36 @@ async fn handle_chat_slash_command(
         }
         "/status" => {
             print_status(cfg)?;
+            println!(
+                "active_skill: {}",
+                active_skill.as_deref().unwrap_or("(none)")
+            );
         }
         "/read" => {
             let Some(file) = parts.next() else {
                 println!("Usage: /read <file>");
                 return Ok(());
             };
-            let question = parts.collect::<Vec<_>>().join(" ");
-            if question.trim().is_empty() {
+                let question = parts.collect::<Vec<_>>().join(" ");
+                if question.trim().is_empty() {
                 let content = read_text_file(Path::new(file))?;
                 push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
                 println!(
                     "Read {} (content hidden). Ask a follow-up question to analyze it.",
                     file
                 );
-            } else {
-                submit_file_to_model(cfg, history, &question, file, *render_markdown).await?;
+                } else {
+                    submit_file_to_model(
+                        cfg,
+                        history,
+                        &question,
+                        file,
+                        *render_markdown,
+                        active_skill.as_deref(),
+                    )
+                    .await?;
+                }
             }
-        }
         "/askfile" => {
             let Some(file) = parts.next() else {
                 println!("Usage: /askfile <file> <question>");
@@ -804,7 +1008,15 @@ async fn handle_chat_slash_command(
                 println!("Usage: /askfile <file> <question>");
                 return Ok(());
             }
-            submit_file_to_model(cfg, history, &question, file, *render_markdown).await?;
+            submit_file_to_model(
+                cfg,
+                history,
+                &question,
+                file,
+                *render_markdown,
+                active_skill.as_deref(),
+            )
+            .await?;
         }
         "/list" => {
             let path = parts.next().unwrap_or(".");
@@ -898,6 +1110,66 @@ async fn handle_chat_slash_command(
                     println!("Active model switched to '{}'.", name);
                 }
                 _ => println!("Usage: /model <list|use>"),
+            }
+        }
+        "/skill" => {
+            let Some(sub) = parts.next() else {
+                println!("Usage: /skill <list|show|use|clear>");
+                return Ok(());
+            };
+            match sub {
+                "list" => {
+                    let skills = load_skills()?;
+                    if skills.is_empty() {
+                        println!("No skills found.");
+                    } else {
+                        for skill in skills {
+                            let mark = if active_skill
+                                .as_deref()
+                                .is_some_and(|v| v.eq_ignore_ascii_case(&skill.manifest.name))
+                            {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!("{mark} {}", skill.manifest.name);
+                        }
+                    }
+                }
+                "show" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /skill show <name>");
+                        return Ok(());
+                    };
+                    let Some(skill) = find_skill(name)? else {
+                        println!("Skill not found: {}", name);
+                        return Ok(());
+                    };
+                    println!("Skill: {}", skill.manifest.name);
+                    println!("Description: {}", skill.manifest.description);
+                    if !skill.prompt_text.trim().is_empty() {
+                        println!("Prompt: {}", truncate_preview(&skill.prompt_text, 180));
+                    }
+                }
+                "use" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /skill use <name>");
+                        return Ok(());
+                    };
+                    let Some(skill) = find_skill(name)? else {
+                        println!("Skill not found: {}", name);
+                        return Ok(());
+                    };
+                    save_active_skill_for_session(active_session, Some(&skill.manifest.name))?;
+                    *active_skill = Some(skill.manifest.name.clone());
+                    println!("Active skill switched to '{}'.", skill.manifest.name);
+                }
+                "clear" => {
+                    save_active_skill_for_session(active_session, None)?;
+                    *active_skill = None;
+                    println!("Active skill cleared.");
+                }
+                _ => println!("Usage: /skill <list|show|use|clear>"),
             }
         }
         _ => {
@@ -1319,6 +1591,19 @@ fn is_skipped_tool_output(output: &str) -> bool {
 
 fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String> {
     let tool = call.tool.trim().to_ascii_lowercase();
+    if let Some(skill) = runtime_active_skill()
+        && !skill.manifest.allowed_tools.is_empty()
+        && !skill
+            .manifest
+            .allowed_tools
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(&tool))
+    {
+        return Ok(format!(
+            "Skipped unsupported tool by active skill '{}': {}",
+            skill.manifest.name, call.tool
+        ));
+    }
     match tool.as_str() {
         "shell" => execute_shell_tool_call(cfg, call),
         "fs.read_file" | "fs_read_file" => execute_native_fs_read(call),
@@ -1806,9 +2091,15 @@ async fn run_agent_turn(
     mode: &str,
     session: Option<&str>,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
-    let system = build_system_prompt(cfg, mode);
-    run_agent_turn_with_system(cfg, history, &system, session, render_markdown, true).await
+    let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
+    set_runtime_active_skill(runtime_skill)?;
+    let system = build_system_prompt_with_skill(cfg, mode, active_skill)?;
+    let result =
+        run_agent_turn_with_system(cfg, history, &system, session, render_markdown, true).await;
+    let _ = set_runtime_active_skill(None);
+    result
 }
 
 async fn run_agent_turn_with_system(
@@ -1949,26 +2240,7 @@ async fn run_agent_turn_with_system_native(
                         return Ok(());
                     }
                     record_diagnostic(cfg, "write-hard-fail", err, session);
-                    println!("assistant> {}", err);
-                    return Ok(());
-                }
-                if changed_delta.is_empty() && looks_like_patch_request(last_user) {
-                    let err = "Patch/diff task failed: model did not execute any tool_calls, so no real code diff was produced.";
-                    if try_executor_model_fallback(
-                        cfg,
-                        history,
-                        system,
-                        session,
-                        render_markdown,
-                        err,
-                        allow_executor_fallback,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    record_diagnostic(cfg, "patch-hard-fail", err, session);
-                    println!("assistant> {}", err);
+                    println!("assistant> {}", user_visible_write_fail());
                     return Ok(());
                 }
                 if looks_like_manual_action_answer(&answer)
@@ -1989,7 +2261,7 @@ async fn run_agent_turn_with_system_native(
                         return Ok(());
                     }
                     record_diagnostic(cfg, "manual-delegation-blocked", err, session);
-                    println!("assistant> {}", err);
+                    println!("assistant> {}", user_visible_manual_delegation());
                     return Ok(());
                 }
                 history.push(ChatMessage {
@@ -2228,26 +2500,7 @@ async fn run_agent_turn_with_system_legacy(
                     return Ok(());
                 }
                 record_diagnostic(cfg, "write-hard-fail", err, session);
-                println!("assistant> {}", err);
-                return Ok(());
-            }
-            if changed_delta.is_empty() && looks_like_patch_request(&last_user) {
-                let err = "Patch/diff task failed: model did not execute any tool_calls, so no real code diff was produced.";
-                if try_executor_model_fallback(
-                    cfg,
-                    history,
-                    system,
-                    session,
-                    render_markdown,
-                    err,
-                    allow_executor_fallback,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                record_diagnostic(cfg, "patch-hard-fail", err, session);
-                println!("assistant> {}", err);
+                println!("assistant> {}", user_visible_write_fail());
                 return Ok(());
             }
             if looks_like_manual_action_answer(&answer)
@@ -2268,7 +2521,7 @@ async fn run_agent_turn_with_system_legacy(
                     return Ok(());
                 }
                 record_diagnostic(cfg, "manual-delegation-blocked", err, session);
-                println!("assistant> {}", err);
+                println!("assistant> {}", user_visible_manual_delegation());
                 return Ok(());
             }
             return Ok(());
@@ -2476,6 +2729,7 @@ fn looks_like_manual_action_answer(text: &str) -> bool {
         || t.contains("请你自己改")
 }
 
+#[allow(dead_code)]
 fn is_active_relay_provider(cfg: &Config) -> bool {
     cfg.model_profiles
         .get(&cfg.model)
@@ -2483,6 +2737,7 @@ fn is_active_relay_provider(cfg: &Config) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn should_force_tool_retry(cfg: &Config, answer: &str) -> bool {
     is_active_relay_provider(cfg)
         || active_effective_tool_mode(cfg) == ToolCallMode::Json
@@ -2654,8 +2909,11 @@ async fn run_chat_turn(
     history: &mut Vec<ChatMessage>,
     mode: &str,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
-    let mut system = build_system_prompt(cfg, mode);
+    let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
+    set_runtime_active_skill(runtime_skill)?;
+    let mut system = build_system_prompt_with_skill(cfg, mode, active_skill)?;
     maybe_compact_history(history, cfg);
     println!("{}", color_dim("(phase: response)"));
     print!(
@@ -2701,6 +2959,7 @@ async fn run_chat_turn(
                 role: "assistant".to_string(),
                 content: msg.to_string(),
             });
+            let _ = set_runtime_active_skill(None);
             return Ok(());
         }
 
@@ -2712,8 +2971,10 @@ async fn run_chat_turn(
             role: "assistant".to_string(),
             content: answer,
         });
+        let _ = set_runtime_active_skill(None);
         return Ok(());
     }
+    let _ = set_runtime_active_skill(None);
     Ok(())
 }
 
@@ -3450,7 +3711,13 @@ fn matches_list(list: &[String], cmd: &str) -> bool {
 }
 
 fn is_trusted_command(cfg: &Config, cmd: &str) -> bool {
-    matches_list(&cfg.auto_exec_trusted, cmd)
+    if matches_list(&cfg.auto_exec_trusted, cmd) {
+        return true;
+    }
+    if let Some(skill) = runtime_active_skill() {
+        return matches_list(&skill.manifest.trusted_commands, cmd);
+    }
+    false
 }
 
 fn command_prefix(cmd: &str) -> String {
@@ -3754,7 +4021,16 @@ pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Resul
     });
 
     maybe_compact_history(&mut history, &cfg);
-    run_agent_turn(&mut cfg, &mut history, "chat", Some(&active_session), true).await?;
+    let active_skill = load_active_skill_for_session(&active_session)?;
+    run_agent_turn(
+        &mut cfg,
+        &mut history,
+        "chat",
+        Some(&active_session),
+        true,
+        active_skill.as_deref(),
+    )
+    .await?;
     save_session(&active_session, &history)?;
 
     let changed = list_workspace_changed_files()?;
@@ -4284,3 +4560,4 @@ fn looks_more_readable_chinese(candidate: &str, original: &str) -> bool {
     }
     score(candidate) > score(original)
 }
+

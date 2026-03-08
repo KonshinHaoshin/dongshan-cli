@@ -55,6 +55,7 @@ pub async fn call_llm_with_history(
     call_llm_with_history_impl(cfg, system_prompt, history, false, None).await
 }
 
+#[allow(dead_code)]
 pub async fn call_llm_with_history_stream(
     cfg: &Config,
     system_prompt: &str,
@@ -347,3 +348,4 @@ fn extract_native_tool_calls(message: &Value) -> Vec<NativeFunctionCall> {
     }
     out
 }
+

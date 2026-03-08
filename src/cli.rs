@@ -50,6 +50,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Manage local skills and session skill binding
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Diagnose current model/profile/network health
     Doctor,
     /// Basic file system tools (read/list/grep)
@@ -206,5 +211,29 @@ pub enum ModelsCommand {
         api_key_env: Option<String>,
         #[arg(long)]
         api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommand {
+    /// List available skills
+    List,
+    /// Show one skill manifest and prompt preview
+    Show { name: String },
+    /// Bind one skill to a session
+    Use {
+        name: String,
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
+    /// Clear active skill for a session
+    Clear {
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
+    /// Show active skill for a session
+    Current {
+        #[arg(long, default_value = "default")]
+        session: String,
     },
 }
