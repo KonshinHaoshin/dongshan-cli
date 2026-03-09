@@ -27,7 +27,7 @@ use crate::fs_tools::{
     try_rg_files, try_rg_grep,
 };
 use crate::llm::{
-    ChatMessage, NativeFunctionCall, build_openai_messages, call_llm_with_history,
+    ChatAttachment, ChatMessage, NativeFunctionCall, build_openai_messages, call_llm_with_history,
     call_llm_with_history_stream_tools, call_llm_with_messages_native_tools,
 };
 use crate::prompt_store::list_prompt_names;
@@ -174,6 +174,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
         history.push(ChatMessage {
             role: "user".to_string(),
             content: augmented_input,
+            attachments: Vec::new(),
         });
 
         maybe_compact_history(&mut history, &cfg);
@@ -407,6 +408,7 @@ async fn submit_file_to_model(
     history.push(ChatMessage {
         role: "user".to_string(),
         content: prompt,
+        attachments: Vec::new(),
     });
     maybe_compact_history(history, cfg);
     let system = build_system_prompt_with_skill(cfg, "review", active_skill)?;
@@ -428,15 +430,66 @@ fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str
     history.push(ChatMessage {
         role: "user".to_string(),
         content: user_input.to_string(),
+        attachments: Vec::new(),
     });
     history.push(ChatMessage {
         role: "assistant".to_string(),
         content: format!("tool[{tool}] output:\n{output}"),
+        attachments: Vec::new(),
     });
 }
 
 fn clip_output(text: &str, max_len: usize) -> String {
     truncate_with_suffix(text, max_len, "...\n[truncated]")
+}
+
+fn read_clipboard_image_attachment() -> Result<Option<ChatAttachment>> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 3 }
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+$ms = New-Object System.IO.MemoryStream
+$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+Write-Output ('data:image/png;base64,' + $b64)
+"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .output()
+            .context("failed to invoke powershell clipboard reader")?;
+        match output.status.code() {
+            Some(3) => return Ok(None),
+            Some(0) => {}
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                bail!(
+                    "clipboard image reader failed{}",
+                    if stderr.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(": {}", stderr)
+                    }
+                );
+            }
+        }
+        let data_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if data_url.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(ChatAttachment {
+            kind: "image".to_string(),
+            media_type: "image/png".to_string(),
+            data_url,
+        }));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        bail!("clipboard image paste is currently implemented for Windows terminals only");
+    }
 }
 
 fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
@@ -467,6 +520,7 @@ fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
     compacted.push(ChatMessage {
         role: "assistant".to_string(),
         content: format!("[session-summary]\n{}", summary),
+        attachments: Vec::new(),
     });
     compacted.extend_from_slice(&history[split_at..]);
     *history = compacted;
@@ -855,6 +909,7 @@ async fn handle_chat_slash_command(
             c("/askfile <file> <question>", "ask about a file");
             c("/list [path]", "list files");
             c("/grep <pattern> [path]", "search files");
+            c("/paste [question]", "paste clipboard image into current turn");
             c("/prompt show", "show active prompt");
             c("/prompt list", "list prompts");
             c("/prompt use <name>", "switch prompt");
@@ -973,31 +1028,88 @@ async fn handle_chat_slash_command(
                 active_skill.as_deref().unwrap_or("(none)")
             );
         }
+        "/paste" => {
+            let attachment = match read_clipboard_image_attachment() {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    println!("No image found in clipboard.");
+                    return Ok(());
+                }
+                Err(err) => {
+                    println!("Failed to read clipboard image: {}", err);
+                    return Ok(());
+                }
+            };
+            let mut question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                let inline = ask("image> ")?;
+                question = inline.trim().to_string();
+            }
+            let prompt = if question.trim().is_empty() {
+                "Please analyze this pasted image.".to_string()
+            } else {
+                question.trim().to_string()
+            };
+            let turn_skill = match active_skill.as_deref() {
+                Some(name) => find_skill(name)?,
+                None => pick_skill_for_input(&prompt)?,
+            };
+            let use_agent = should_use_agent_for_turn(cfg, history, &prompt, *exec_mode)
+                .await
+                .unwrap_or_else(|_| should_use_agent_for_input(&prompt, *exec_mode));
+            let augmented_input = augment_user_input_with_workspace_context(&prompt)?;
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: augmented_input,
+                attachments: vec![attachment],
+            });
+            maybe_compact_history(history, cfg);
+            if use_agent {
+                run_agent_turn(
+                    cfg,
+                    history,
+                    "chat",
+                    Some(active_session),
+                    *render_markdown,
+                    turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+                )
+                .await?;
+            } else {
+                run_chat_turn(
+                    cfg,
+                    history,
+                    "chat-lite",
+                    *render_markdown,
+                    turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+                )
+                .await?;
+            }
+        }
         "/read" => {
             let Some(file) = parts.next() else {
                 println!("Usage: /read <file>");
                 return Ok(());
             };
-                let question = parts.collect::<Vec<_>>().join(" ");
-                if question.trim().is_empty() {
+            let question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
                 let content = read_text_file(Path::new(file))?;
                 push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
                 println!(
                     "Read {} (content hidden). Ask a follow-up question to analyze it.",
                     file
                 );
-                } else {
-                    submit_file_to_model(
-                        cfg,
-                        history,
-                        &question,
-                        file,
-                        *render_markdown,
-                        active_skill.as_deref(),
-                    )
-                    .await?;
-                }
+            } else {
+                submit_file_to_model(
+                    cfg,
+                    history,
+                    &question,
+                    file,
+                    *render_markdown,
+                    active_skill.as_deref(),
+                )
+                .await?;
             }
+        }
         "/askfile" => {
             let Some(file) = parts.next() else {
                 println!("Usage: /askfile <file> <question>");
@@ -2267,6 +2379,7 @@ async fn run_agent_turn_with_system_native(
                 history.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: answer,
+                    attachments: Vec::new(),
                 });
                 return Ok(());
             }
@@ -2323,7 +2436,6 @@ async fn run_agent_turn_with_system_native(
             );
             return Ok(());
         }
-
         let (exec_result, tool_msgs) = execute_native_function_calls(cfg, &resp.tool_calls)?;
         let native_calls = native_calls_to_values(&resp.tool_calls, cfg, session);
         record_step_artifact_from_native(
@@ -2466,6 +2578,7 @@ async fn run_agent_turn_with_system_legacy(
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
+            attachments: Vec::new(),
         });
 
         if !exec_result.had_blocks {
@@ -2481,6 +2594,7 @@ async fn run_agent_turn_with_system_legacy(
                 history.push(ChatMessage {
                     role: "user".to_string(),
                     content: format!("{msg} {}", STRICT_TOOL_CALL_INSTRUCTION),
+                    attachments: Vec::new(),
                 });
                 continue;
             }
@@ -2537,6 +2651,7 @@ async fn run_agent_turn_with_system_legacy(
                     verification,
                     recovery_hint
                 ),
+                attachments: Vec::new(),
             });
             steps += 1;
             if steps >= MAX_AUTO_TOOL_STEPS {
@@ -2557,6 +2672,7 @@ async fn run_agent_turn_with_system_legacy(
                     "Your last response had invalid tool_calls format. {}",
                     STRICT_TOOL_CALL_INSTRUCTION
                 ),
+                attachments: Vec::new(),
             });
             continue;
         }
@@ -2569,6 +2685,7 @@ async fn run_agent_turn_with_system_legacy(
                     "Your last response used unsupported execution format or unsafe commands. {}",
                     STRICT_TOOL_CALL_INSTRUCTION
                 ),
+                attachments: Vec::new(),
             });
             continue;
         }
@@ -2777,10 +2894,6 @@ async fn try_executor_model_fallback(
     let before = current_changed_file_set().unwrap_or_default();
     let before_fp = snapshot_file_fingerprints(&before);
     let source_model = cfg.model.clone();
-    println!(
-        "assistant> Primary model '{}' failed execution guard ({}). Trying executor model '{}' ...",
-        source_model, reason, executor_model
-    );
     record_diagnostic(
         cfg,
         "executor-fallback-start",
@@ -2806,7 +2919,6 @@ async fn try_executor_model_fallback(
     if let Err(err) = exec_res {
         let msg = format!("executor model request failed: {}", err);
         record_diagnostic(&exec_cfg, "executor-fallback-failed", &msg, session);
-        println!("assistant> {}", msg);
         return Ok(false);
     }
 
@@ -2817,7 +2929,6 @@ async fn try_executor_model_fallback(
     if delta.is_empty() && !content_changed {
         let msg = "executor fallback finished but still no detectable file changes were produced.";
         record_diagnostic(&exec_cfg, "executor-fallback-no-diff", msg, session);
-        println!("assistant> {}", msg);
         return Ok(false);
     }
 
@@ -2831,7 +2942,6 @@ async fn try_executor_model_fallback(
         "executor fallback succeeded with content changes on existing changed files.".to_string()
     };
     record_diagnostic(&exec_cfg, "executor-fallback-succeeded", &msg, session);
-    println!("assistant> {}", msg);
 
     *cfg = exec_cfg;
     let _ = save_config(cfg);
@@ -2958,6 +3068,7 @@ async fn run_chat_turn(
             history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: msg.to_string(),
+                attachments: Vec::new(),
             });
             let _ = set_runtime_active_skill(None);
             return Ok(());
@@ -2970,6 +3081,7 @@ async fn run_chat_turn(
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer,
+            attachments: Vec::new(),
         });
         let _ = set_runtime_active_skill(None);
         return Ok(());
@@ -3021,6 +3133,7 @@ async fn classify_mode_with_llm(
              Request: {input}\n\
              Output JSON only: {{\"mode\":\"agent\"|\"chat\",\"reason\":\"short\"}}"
         ),
+        attachments: Vec::new(),
     });
     let system = "You are a strict mode router for coding assistant.\n\
 Choose \"agent\" when task likely needs repo inspection, filesystem commands, file edits, test/build execution, or multi-step actions.\n\
@@ -4018,6 +4131,7 @@ pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Resul
     history.push(ChatMessage {
         role: "user".to_string(),
         content: augmented_input,
+        attachments: Vec::new(),
     });
 
     maybe_compact_history(&mut history, &cfg);
@@ -4058,6 +4172,14 @@ fn print_status(cfg: &Config) -> Result<()> {
     println!(
         "executor_model: {}",
         cfg.executor_model.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "fallback_models: {}",
+        if cfg.fallback_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.fallback_models.join(", ")
+        }
     );
     let changed = list_workspace_changed_files()?;
     println!("changed_files: {}", changed.len());

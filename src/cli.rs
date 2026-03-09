@@ -134,6 +134,9 @@ pub enum ConfigCommand {
         /// Optional executor model used as fallback when relay model fails to produce real diffs
         #[arg(long)]
         executor_model: Option<String>,
+        /// Comma-separated fallback models tried silently when the active model fails
+        #[arg(long)]
+        fallback_models: Option<String>,
     },
 }
 

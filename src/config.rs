@@ -98,6 +98,8 @@ pub struct Config {
     pub model_catalog: Vec<String>,
     #[serde(default)]
     pub executor_model: Option<String>,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for Config {
@@ -135,6 +137,7 @@ impl Default for Config {
             history_max_chars: default_history_max_chars(),
             model_catalog: vec![model],
             executor_model: None,
+            fallback_models: Vec::new(),
         }
     }
 }
@@ -347,6 +350,16 @@ pub fn ensure_model_catalog(cfg: &mut Config) {
 
     if seen.insert(cfg.model.clone()) {
         out.push(cfg.model.clone());
+    }
+
+    for m in &cfg.fallback_models {
+        let name = m.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
     }
 
     let profile_keys = cfg.model_profiles.keys().cloned().collect::<Vec<_>>();

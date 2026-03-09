@@ -41,6 +41,7 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             history_max_messages,
             history_max_chars,
             executor_model,
+            fallback_models,
         } => {
             let mut cfg = load_config_or_default()?;
             if let Some(v) = model {
@@ -94,6 +95,12 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
                 } else {
                     cfg.executor_model = Some(name.to_string());
                     add_model_with_active_profile(&mut cfg, name);
+                }
+            }
+            if let Some(v) = fallback_models {
+                cfg.fallback_models = parse_csv_list(&v);
+                for name in cfg.fallback_models.clone() {
+                    add_model_with_active_profile(&mut cfg, &name);
                 }
             }
             ensure_model_catalog(&mut cfg);
