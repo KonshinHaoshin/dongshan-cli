@@ -174,10 +174,10 @@ pub fn resolve_session_name(requested: &str) -> Result<String> {
 
 fn candidate_skill_dirs() -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
+    dirs.push(config_dir()?.join("skills"));
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd.join(".dongshan").join("skills"));
     }
-    dirs.push(config_dir()?.join("skills"));
     Ok(dirs)
 }
 

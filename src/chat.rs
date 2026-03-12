@@ -223,7 +223,7 @@ async fn handle_natural_language_tool_command(
             } else {
                 "(stored)".to_string()
             };
-            out.push_str(&format!("- {}: {}\n", name, preview));
+            out.push_str(&format!("- {name}: {preview}\n"));
         }
         println!("{out}");
         push_tool_result(history, input, "prompt.list", &out);
@@ -241,7 +241,7 @@ async fn handle_natural_language_tool_command(
         }
         cfg.active_prompt = name.clone();
         save_config(cfg)?;
-        let out = format!("Active prompt switched to '{}'.", name);
+        let out = format!("Active prompt switched to '{name}'.");
         println!("{out}");
         push_tool_result(history, input, "prompt.use", &out);
         return Ok(true);
@@ -273,12 +273,12 @@ async fn handle_natural_language_tool_command(
     if let Some(name) = parse_model_use(input, &lower) {
         ensure_model_catalog(cfg);
         if !cfg.model_catalog.iter().any(|m| m == &name) {
-            println!("Model not found in catalog: {}", name);
+            println!("Model not found in catalog: {name}");
             return Ok(true);
         }
         set_active_model(cfg, &name);
         save_config(cfg)?;
-        let out = format!("Active model switched to '{}'.", name);
+        let out = format!("Active model switched to '{name}'.");
         println!("{out}");
         push_tool_result(history, input, "model.use", &out);
         return Ok(true);
@@ -355,8 +355,8 @@ async fn inspect_path_reference(
 ) -> Result<()> {
     let target = Path::new(path);
     if !target.exists() {
-        println!("Path not found: {}", path);
-        push_tool_result(history, user_input, "fs.path", &format!("Path not found: {}", path));
+        println!("Path not found: {path}");
+        push_tool_result(history, user_input, "fs.path", &format!("Path not found: {path}"));
         return Ok(());
     }
     if target.is_dir() {
@@ -367,7 +367,7 @@ async fn inspect_path_reference(
     }
     if is_probably_binary_file(target) {
         let summary = describe_path_metadata(target)?;
-        println!("{}", summary);
+        println!("{summary}");
         push_tool_result(history, user_input, "fs.stat", &summary);
         return Ok(());
     }
@@ -3958,7 +3958,7 @@ fn run_translated_safe_command(cmd: &str) -> Result<Option<String>> {
 }
 
 fn run_windows_grep_translation(cmd: &str) -> Result<String> {
-    let pattern = extract_quoted(cmd).unwrap_or_else(|| "TODO".to_string());
+    let pattern = extract_quoted(cmd).unwrap_or_else(|| ".*".to_string());
     let pattern = pattern.replace("\\|", "|");
     let glob = parse_flag_value(cmd, "--include=").unwrap_or_else(|| "*.txt".to_string());
     let path = if cmd.contains(" . ") || cmd.ends_with(" .") {

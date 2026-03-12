@@ -7,19 +7,18 @@ use anyhow::Result;
 
 pub fn augment_user_input_with_workspace_context(input: &str) -> Result<String> {
     let cwd = env::current_dir()?;
-    let mut out = format!("Workspace CWD: {}\nUser request: {}", cwd.display(), input);
 
     if is_project_analysis_request(input) {
         let snapshot = build_project_snapshot(&cwd)?;
-        out = format!(
+        Ok(format!(
             "Workspace CWD: {}\nAuto project snapshot:\n{}\n\nUser request: {}",
             cwd.display(),
             snapshot,
             input
-        );
+        ))
+    } else {
+        Ok(format!("Workspace CWD: {}\nUser request: {}", cwd.display(), input))
     }
-
-    Ok(out)
 }
 
 fn is_project_analysis_request(input: &str) -> bool {
