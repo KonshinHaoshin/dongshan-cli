@@ -33,12 +33,35 @@ pub enum ToolCallMode {
     Json,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoicePolicy {
+    Auto,
+    None,
+    Required,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormatPolicy {
+    Text,
+    JsonObject,
+}
+
 fn default_model_provider() -> ModelApiProvider {
     ModelApiProvider::Openai
 }
 
 fn default_tool_call_mode() -> ToolCallMode {
     ToolCallMode::Auto
+}
+
+fn default_tool_choice_policy() -> ToolChoicePolicy {
+    ToolChoicePolicy::Auto
+}
+
+fn default_response_format_policy() -> ResponseFormatPolicy {
+    ResponseFormatPolicy::Text
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize)]
@@ -55,6 +78,10 @@ pub struct ModelProfile {
     pub provider: ModelApiProvider,
     #[serde(default = "default_tool_call_mode")]
     pub tool_mode: ToolCallMode,
+    #[serde(default = "default_tool_choice_policy")]
+    pub tool_choice_policy: ToolChoicePolicy,
+    #[serde(default = "default_response_format_policy")]
+    pub response_format_policy: ResponseFormatPolicy,
     pub base_url: String,
     pub api_key_env: String,
     #[serde(default)]
@@ -98,6 +125,12 @@ pub struct Config {
     pub model_catalog: Vec<String>,
     #[serde(default)]
     pub executor_model: Option<String>,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
+    #[serde(default = "default_tool_choice_policy")]
+    pub tool_choice_policy: ToolChoicePolicy,
+    #[serde(default = "default_response_format_policy")]
+    pub response_format_policy: ResponseFormatPolicy,
 }
 
 impl Default for Config {
@@ -109,6 +142,8 @@ impl Default for Config {
             ModelProfile {
                 provider: ModelApiProvider::Openai,
                 tool_mode: ToolCallMode::Auto,
+                tool_choice_policy: ToolChoicePolicy::Auto,
+                response_format_policy: ResponseFormatPolicy::Text,
                 base_url: base_url.clone(),
                 api_key_env: api_key_env.clone(),
                 api_key: None,
@@ -135,6 +170,9 @@ impl Default for Config {
             history_max_chars: default_history_max_chars(),
             model_catalog: vec![model],
             executor_model: None,
+            fallback_models: Vec::new(),
+            tool_choice_policy: ToolChoicePolicy::Auto,
+            response_format_policy: ResponseFormatPolicy::Text,
         }
     }
 }
@@ -227,6 +265,8 @@ pub fn apply_preset(cfg: &mut Config, provider: ProviderPreset) {
         ModelProfile {
             provider: ModelApiProvider::Openai,
             tool_mode: ToolCallMode::Auto,
+            tool_choice_policy: cfg.tool_choice_policy,
+            response_format_policy: cfg.response_format_policy,
             base_url,
             api_key_env,
             api_key: cfg.api_key.clone(),
@@ -323,6 +363,16 @@ pub fn ensure_model_catalog(cfg: &mut Config) {
             .get(&cfg.model)
             .map(|p| p.tool_mode)
             .unwrap_or(ToolCallMode::Auto),
+        tool_choice_policy: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.tool_choice_policy)
+            .unwrap_or(cfg.tool_choice_policy),
+        response_format_policy: cfg
+            .model_profiles
+            .get(&cfg.model)
+            .map(|p| p.response_format_policy)
+            .unwrap_or(cfg.response_format_policy),
         base_url: cfg.base_url.clone(),
         api_key_env: cfg.api_key_env.clone(),
         api_key: cfg.api_key.clone(),
@@ -347,6 +397,16 @@ pub fn ensure_model_catalog(cfg: &mut Config) {
 
     if seen.insert(cfg.model.clone()) {
         out.push(cfg.model.clone());
+    }
+
+    for m in &cfg.fallback_models {
+        let name = m.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
     }
 
     let profile_keys = cfg.model_profiles.keys().cloned().collect::<Vec<_>>();
@@ -375,6 +435,8 @@ pub fn apply_active_model_profile(cfg: &mut Config) {
         cfg.base_url = p.base_url.clone();
         cfg.api_key_env = p.api_key_env.clone();
         cfg.api_key = p.api_key.clone();
+        cfg.tool_choice_policy = p.tool_choice_policy;
+        cfg.response_format_policy = p.response_format_policy;
     }
 }
 
@@ -393,6 +455,16 @@ pub fn update_active_model_profile(cfg: &mut Config) {
                 .get(&cfg.model)
                 .map(|p| p.tool_mode)
                 .unwrap_or(ToolCallMode::Auto),
+            tool_choice_policy: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.tool_choice_policy)
+                .unwrap_or(cfg.tool_choice_policy),
+            response_format_policy: cfg
+                .model_profiles
+                .get(&cfg.model)
+                .map(|p| p.response_format_policy)
+                .unwrap_or(cfg.response_format_policy),
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -426,6 +498,8 @@ pub fn add_model_with_active_profile(cfg: &mut Config, model: &str) {
         .unwrap_or(ModelProfile {
             provider: ModelApiProvider::Openai,
             tool_mode: ToolCallMode::Auto,
+            tool_choice_policy: cfg.tool_choice_policy,
+            response_format_policy: cfg.response_format_policy,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -470,6 +544,8 @@ pub fn upsert_model_profile(
         .unwrap_or(ModelProfile {
             provider: ModelApiProvider::Openai,
             tool_mode: ToolCallMode::Auto,
+            tool_choice_policy: cfg.tool_choice_policy,
+            response_format_policy: cfg.response_format_policy,
             base_url: cfg.base_url.clone(),
             api_key_env: cfg.api_key_env.clone(),
             api_key: cfg.api_key.clone(),
@@ -590,6 +666,9 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
         prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
+        prompt.push_str("\nFor complex or long-running tasks, you may optionally use update_plan to publish a concise task checklist.");
+        prompt.push_str("\nDo not use update_plan for simple one-step tasks.");
+        prompt.push_str("\nIf you use update_plan, keep it short and update it only when status materially changes.");
         match active_effective_tool_mode(cfg) {
             ToolCallMode::Json => {
                 prompt.push_str("\nTool protocol mode: json.");
@@ -615,6 +694,7 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\n- fs_move args: {from, to}");
         prompt.push_str("\n- fs_delete args: {path, recursive?}");
         prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
+        prompt.push_str("\n- update_plan args: {explanation?, items:[{step, status}...]} where status is pending|in_progress|completed");
         prompt.push_str("\n- shell args: {command} (legacy fallback)");
         prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs_read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
         prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");

@@ -43,6 +43,19 @@ cargo install --path .
 dongshan --help
 ```
 
+Install with npm globally:
+
+```powershell
+npm install -g dongshan
+dongshan --help
+```
+
+Notes:
+
+- `npm -g` installs a thin Node wrapper and downloads the matching release binary from GitHub.
+- Supported in this repo today: `win32-x64`, `linux-x64`.
+- The npm package name is `dongshan`, and the command is also `dongshan`.
+
 If command is not found, add Cargo bin to PATH:
 
 ```powershell
@@ -105,6 +118,22 @@ GitHub Actions will build and upload:
 - `SHA256SUMS-windows.txt`
 - `dongshan-linux-x86_64.tar.gz`
 - `SHA256SUMS-linux.txt`
+
+## npm Global Install Packaging
+
+This repo also supports global install via npm:
+
+- Package entry: `package.json`
+- Launcher shim: `npm/bin/dongshan.js`
+- Install downloader: `npm/install.js`
+
+Publish flow:
+
+```powershell
+npm publish
+```
+
+The npm package does not compile Rust on user machines. It downloads the matching GitHub Release binary for the package version.
 
 ## Quick Start
 

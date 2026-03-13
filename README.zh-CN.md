@@ -40,6 +40,19 @@ cargo install --path .
 dongshan --help
 ```
 
+也支持通过 npm 全局安装：
+
+```powershell
+npm install -g dongshan
+dongshan --help
+```
+
+说明：
+
+- `npm -g` 安装的是一个 Node 包壳，安装时会自动从 GitHub Release 下载对应平台二进制。
+- 当前已支持：`win32-x64`、`linux-x64`。
+- npm 包名是 `dongshan`，命令名也是 `dongshan`。
+
 ## Windows 安装包（Setup EXE）
 
 给普通用户推荐直接用 Release 安装包：
@@ -95,6 +108,22 @@ GitHub Actions 会自动上传：
 - `SHA256SUMS-windows.txt`
 - `dongshan-linux-x86_64.tar.gz`
 - `SHA256SUMS-linux.txt`
+
+## npm 全局安装发布
+
+仓库也支持通过 npm 发布全局安装包：
+
+- 包入口：`package.json`
+- 命令转发：`npm/bin/dongshan.js`
+- 安装下载器：`npm/install.js`
+
+发布命令：
+
+```powershell
+npm publish
+```
+
+npm 包不会在用户机器上编译 Rust，而是根据包版本自动下载对应 GitHub Release 的二进制。
 
 ## 快速开始
 

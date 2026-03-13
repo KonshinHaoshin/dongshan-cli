@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{AutoExecMode, ModelApiProvider, ProviderPreset};
+use crate::config::{
+    AutoExecMode, ModelApiProvider, ProviderPreset, ResponseFormatPolicy, ToolChoicePolicy,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "dongshan", version, about = "A simple AI coding CLI in Rust")]
@@ -49,6 +51,11 @@ pub enum Commands {
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
+    },
+    /// Manage local skills and session skill binding
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     /// Diagnose current model/profile/network health
     Doctor,
@@ -129,6 +136,15 @@ pub enum ConfigCommand {
         /// Optional executor model used as fallback when relay model fails to produce real diffs
         #[arg(long)]
         executor_model: Option<String>,
+        /// Comma-separated fallback models tried silently when the active model fails
+        #[arg(long)]
+        fallback_models: Option<String>,
+        /// OpenAI-compatible tool choice policy: auto | none | required
+        #[arg(long, value_enum)]
+        tool_choice_policy: Option<ToolChoicePolicy>,
+        /// OpenAI-compatible response format policy: text | json_object
+        #[arg(long, value_enum)]
+        response_format_policy: Option<ResponseFormatPolicy>,
     },
 }
 
@@ -206,5 +222,29 @@ pub enum ModelsCommand {
         api_key_env: Option<String>,
         #[arg(long)]
         api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCommand {
+    /// List available skills
+    List,
+    /// Show one skill manifest and prompt preview
+    Show { name: String },
+    /// Bind one skill to a session
+    Use {
+        name: String,
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
+    /// Clear active skill for a session
+    Clear {
+        #[arg(long, default_value = "default")]
+        session: String,
+    },
+    /// Show active skill for a session
+    Current {
+        #[arg(long, default_value = "default")]
+        session: String,
     },
 }
