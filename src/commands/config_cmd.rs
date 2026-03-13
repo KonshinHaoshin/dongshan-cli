@@ -42,6 +42,8 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
             history_max_chars,
             executor_model,
             fallback_models,
+            tool_choice_policy,
+            response_format_policy,
         } => {
             let mut cfg = load_config_or_default()?;
             if let Some(v) = model {
@@ -103,6 +105,13 @@ pub fn handle_config(command: ConfigCommand) -> Result<()> {
                     add_model_with_active_profile(&mut cfg, &name);
                 }
             }
+            if let Some(v) = tool_choice_policy {
+                cfg.tool_choice_policy = v;
+            }
+            if let Some(v) = response_format_policy {
+                cfg.response_format_policy = v;
+            }
+            update_active_model_profile(&mut cfg);
             ensure_model_catalog(&mut cfg);
             save_config(&cfg)?;
             println!("Config updated:");

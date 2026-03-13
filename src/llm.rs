@@ -5,8 +5,24 @@ use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crate::config::{Config, resolve_api_key, set_active_model};
+use crate::config::{
+    Config, ResponseFormatPolicy, ToolChoicePolicy, resolve_api_key, set_active_model,
+};
 use crate::util::WorkingStatus;
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiChatRequest {
+    model: String,
+    messages: Vec<Value>,
+    temperature: f32,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<Value>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAttachment {
@@ -84,7 +100,7 @@ pub async fn call_llm_with_history(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Result<String> {
-    call_llm_with_history_impl(cfg, system_prompt, history, false, None, false).await
+    call_llm_with_history_impl(cfg, system_prompt, history, false, None, false, None).await
 }
 
 #[allow(dead_code)]
@@ -93,7 +109,7 @@ pub async fn call_llm_with_history_stream(
     system_prompt: &str,
     history: &[ChatMessage],
 ) -> Result<String> {
-    call_llm_with_history_impl(cfg, system_prompt, history, true, None, false).await
+    call_llm_with_history_impl(cfg, system_prompt, history, true, None, false, None).await
 }
 
 pub async fn call_llm_with_history_stream_tools(
@@ -102,7 +118,24 @@ pub async fn call_llm_with_history_stream_tools(
     history: &[ChatMessage],
     tools: &[Value],
 ) -> Result<String> {
-    call_llm_with_history_impl(cfg, system_prompt, history, true, Some(tools), true).await
+    call_llm_with_history_impl(cfg, system_prompt, history, true, Some(tools), true, None).await
+}
+
+pub async fn call_llm_with_history_json_object(
+    cfg: &Config,
+    system_prompt: &str,
+    history: &[ChatMessage],
+) -> Result<String> {
+    call_llm_with_history_impl(
+        cfg,
+        system_prompt,
+        history,
+        false,
+        None,
+        false,
+        Some(ResponseFormatPolicy::JsonObject),
+    )
+    .await
 }
 
 async fn call_llm_with_history_impl(
@@ -112,13 +145,22 @@ async fn call_llm_with_history_impl(
     stream_output: bool,
     tools: Option<&[Value]>,
     prefer_executor_model: bool,
+    response_format_override: Option<ResponseFormatPolicy>,
 ) -> Result<String> {
     let messages = build_openai_messages(system_prompt, history);
     let working = if stream_output { None } else { Some(WorkingStatus::start("waiting response")) };
     let candidates = request_model_candidates(cfg, prefer_executor_model);
     let mut last_err = None;
     for candidate in candidates {
-        match call_single_llm_with_history(&candidate, &messages, stream_output, tools).await {
+        match call_single_llm_with_history(
+            &candidate,
+            &messages,
+            stream_output,
+            tools,
+            response_format_override,
+        )
+        .await
+        {
             Ok(out) => {
                 if let Some(working) = working {
                     working.finish();
@@ -185,49 +227,17 @@ async fn call_single_llm_with_history(
     messages: &[Value],
     stream_output: bool,
     tools: Option<&[Value]>,
+    response_format_override: Option<ResponseFormatPolicy>,
 ) -> Result<String> {
-    let api_key = resolve_api_key(cfg)?;
-    let mut body = json!({
-        "model": cfg.model,
-        "messages": messages,
-        "temperature": 0.2,
-        "stream": stream_output
-    });
-    if let Some(tools) = tools {
-        body["tools"] = json!(tools);
-        body["tool_choice"] = json!("auto");
-    }
-    let timeout_secs = if stream_output { 900 } else { 120 };
-    let client = Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .context("failed to build HTTP client")?;
-    let resp = client
-        .post(&cfg.base_url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("Request failed: {} [{}]", cfg.base_url, cfg.model))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.context("Failed to read response body")?;
-        bail!("API error {} [{}]: {}", status, cfg.model, text);
-    }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let out = if stream_output && content_type.contains("text/event-stream") {
-        parse_sse_response(resp, false).await?
-    } else {
-        let text = resp.text().await.context("Failed to read response body")?;
-        let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
-        extract_content(&val).context("Cannot parse response content")?
-    };
-    Ok(out)
+    let request = build_openai_chat_request(
+        cfg,
+        messages,
+        stream_output,
+        tools,
+        response_format_override,
+    );
+    let resp = send_openai_chat_request(cfg, &request, request_timeout_secs(stream_output)).await?;
+    parse_openai_text_response(resp, stream_output).await
 }
 
 async fn call_single_llm_native_tools(
@@ -235,23 +245,63 @@ async fn call_single_llm_native_tools(
     messages: &[Value],
     tools: &[Value],
 ) -> Result<NativeLlmResponse> {
+    let request = build_openai_chat_request(cfg, messages, false, Some(tools), None);
+    let resp = send_openai_chat_request(cfg, &request, request_timeout_secs(false).max(900)).await?;
+    parse_openai_native_response(resp).await
+}
+
+fn build_openai_chat_request(
+    cfg: &Config,
+    messages: &[Value],
+    stream: bool,
+    tools: Option<&[Value]>,
+    response_format_override: Option<ResponseFormatPolicy>,
+) -> OpenAiChatRequest {
+    let response_format_policy = response_format_override.unwrap_or(cfg.response_format_policy);
+    OpenAiChatRequest {
+        model: cfg.model.clone(),
+        messages: messages.to_vec(),
+        temperature: 0.2,
+        stream,
+        tools: tools.map(|v| v.to_vec()),
+        tool_choice: tools.and_then(|_| openai_tool_choice_value(cfg.tool_choice_policy)),
+        response_format: openai_response_format_value(response_format_policy),
+    }
+}
+
+fn openai_tool_choice_value(policy: ToolChoicePolicy) -> Option<Value> {
+    match policy {
+        ToolChoicePolicy::Auto => Some(json!("auto")),
+        ToolChoicePolicy::None => Some(json!("none")),
+        ToolChoicePolicy::Required => Some(json!("required")),
+    }
+}
+
+fn openai_response_format_value(policy: ResponseFormatPolicy) -> Option<Value> {
+    match policy {
+        ResponseFormatPolicy::Text => None,
+        ResponseFormatPolicy::JsonObject => Some(json!({"type":"json_object"})),
+    }
+}
+
+fn request_timeout_secs(stream: bool) -> u64 {
+    if stream { 900 } else { 120 }
+}
+
+async fn send_openai_chat_request(
+    cfg: &Config,
+    body: &OpenAiChatRequest,
+    timeout_secs: u64,
+) -> Result<reqwest::Response> {
     let api_key = resolve_api_key(cfg)?;
-    let body = json!({
-        "model": cfg.model,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
-        "temperature": 0.2,
-        "stream": false
-    });
     let client = Client::builder()
-        .timeout(Duration::from_secs(900))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
     let resp = client
         .post(&cfg.base_url)
         .bearer_auth(api_key)
-        .json(&body)
+        .json(body)
         .send()
         .await
         .with_context(|| format!("Request failed: {} [{}]", cfg.base_url, cfg.model))?;
@@ -260,6 +310,25 @@ async fn call_single_llm_native_tools(
         let text = resp.text().await.context("Failed to read response body")?;
         bail!("API error {} [{}]: {}", status, cfg.model, text);
     }
+    Ok(resp)
+}
+
+async fn parse_openai_text_response(resp: reqwest::Response, stream_output: bool) -> Result<String> {
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if stream_output && content_type.contains("text/event-stream") {
+        return parse_sse_response(resp, false).await;
+    }
+    let text = resp.text().await.context("Failed to read response body")?;
+    let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
+    extract_content(&val).context("Cannot parse response content")
+}
+
+async fn parse_openai_native_response(resp: reqwest::Response) -> Result<NativeLlmResponse> {
     let text = resp.text().await.context("Failed to read response body")?;
     let val: Value = serde_json::from_str(&text).context("Invalid JSON response")?;
     let assistant_message = val

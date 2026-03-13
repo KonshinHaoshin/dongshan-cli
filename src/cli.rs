@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{AutoExecMode, ModelApiProvider, ProviderPreset};
+use crate::config::{
+    AutoExecMode, ModelApiProvider, ProviderPreset, ResponseFormatPolicy, ToolChoicePolicy,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "dongshan", version, about = "A simple AI coding CLI in Rust")]
@@ -137,6 +139,12 @@ pub enum ConfigCommand {
         /// Comma-separated fallback models tried silently when the active model fails
         #[arg(long)]
         fallback_models: Option<String>,
+        /// OpenAI-compatible tool choice policy: auto | none | required
+        #[arg(long, value_enum)]
+        tool_choice_policy: Option<ToolChoicePolicy>,
+        /// OpenAI-compatible response format policy: text | json_object
+        #[arg(long, value_enum)]
+        response_format_policy: Option<ResponseFormatPolicy>,
     },
 }
 

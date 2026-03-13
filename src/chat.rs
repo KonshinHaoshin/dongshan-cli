@@ -27,7 +27,8 @@ use crate::fs_tools::{
     try_rg_files, try_rg_grep,
 };
 use crate::llm::{
-    ChatAttachment, ChatMessage, NativeFunctionCall, build_openai_messages, call_llm_with_history,
+    ChatAttachment, ChatMessage, NativeFunctionCall, build_openai_messages,
+    call_llm_with_history_json_object,
     call_llm_with_history_stream_tools, call_llm_with_messages_native_tools,
 };
 use crate::prompt_store::list_prompt_names;
@@ -2397,7 +2398,7 @@ async fn run_agent_turn_with_system_native(
                     )
                 }));
                 steps += 1;
-                if steps >= MAX_AUTO_TOOL_STEPS {
+                if steps > MAX_AUTO_TOOL_STEPS {
                     println!(
                         "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
                         MAX_AUTO_TOOL_STEPS
@@ -2654,7 +2655,7 @@ async fn run_agent_turn_with_system_legacy(
                 attachments: Vec::new(),
             });
             steps += 1;
-            if steps >= MAX_AUTO_TOOL_STEPS {
+            if steps > MAX_AUTO_TOOL_STEPS {
                 println!(
                     "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
                     MAX_AUTO_TOOL_STEPS
@@ -3139,7 +3140,7 @@ async fn classify_mode_with_llm(
 Choose \"agent\" when task likely needs repo inspection, filesystem commands, file edits, test/build execution, or multi-step actions.\n\
 Choose \"chat\" for explanation-only or conceptual Q&A.\n\
 Output JSON only.";
-    let out = call_llm_with_history(cfg, system, &router_history).await?;
+    let out = call_llm_with_history_json_object(cfg, system, &router_history).await?;
     Ok(parse_router_mode(&out))
 }
 
@@ -3834,14 +3835,45 @@ fn is_trusted_command(cfg: &Config, cmd: &str) -> bool {
 }
 
 fn command_prefix(cmd: &str) -> String {
-    let mut it = cmd.split_whitespace();
-    let first = it.next().unwrap_or("").to_string();
-    if first.eq_ignore_ascii_case("git")
-        && let Some(second) = it.next()
-    {
-        return format!("git {}", second);
+    let first_segment = split_first_command_segment(cmd).trim();
+    let tokens: Vec<&str> = first_segment.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i].trim_matches(|c: char| matches!(c, '(' | ')' | '{' | '}'));
+        if token.is_empty() {
+            i += 1;
+            continue;
+        }
+        if token == "&" || token == "." {
+            i += 1;
+            continue;
+        }
+        if token.starts_with('$') {
+            if i + 1 < tokens.len() && tokens[i + 1] == "=" {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("git")
+            && let Some(second) = tokens.get(i + 1)
+        {
+            return format!("git {}", second);
+        }
+        return token.to_string();
     }
-    first
+    cmd.split_whitespace().next().unwrap_or("").to_string()
+}
+
+fn split_first_command_segment(cmd: &str) -> &str {
+    let mut cut = cmd.len();
+    for pat in ["&&", "||", ";", "|"] {
+        if let Some(idx) = cmd.find(pat) {
+            cut = cut.min(idx);
+        }
+    }
+    &cmd[..cut]
 }
 
 fn is_safe_auto_exec_command(cmd: &str) -> bool {
@@ -4169,6 +4201,7 @@ fn print_status(cfg: &Config) -> Result<()> {
     println!("model: {}", cfg.model);
     println!("provider: {}", provider);
     println!("tool_mode: {}", tool_mode);
+    println!("tool_choice_policy: {:?}", cfg.tool_choice_policy);
     println!(
         "executor_model: {}",
         cfg.executor_model.as_deref().unwrap_or("(none)")
@@ -4682,4 +4715,3 @@ fn looks_more_readable_chinese(candidate: &str, original: &str) -> bool {
     }
     score(candidate) > score(original)
 }
-
