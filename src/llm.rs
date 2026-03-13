@@ -271,7 +271,7 @@ fn build_openai_chat_request(
 
 fn openai_tool_choice_value(policy: ToolChoicePolicy) -> Option<Value> {
     match policy {
-        ToolChoicePolicy::Auto => Some(json!("auto")),
+        ToolChoicePolicy::Auto => None,
         ToolChoicePolicy::None => Some(json!("none")),
         ToolChoicePolicy::Required => Some(json!("required")),
     }

@@ -666,6 +666,9 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\nYou are in terminal coding assistant chat mode.");
         prompt.push_str("\nWork as an agent loop: understand task -> inspect code -> edit -> verify -> summarize.");
         prompt.push_str("\nBefore using tools, briefly state intent in one line.");
+        prompt.push_str("\nFor complex or long-running tasks, you may optionally use update_plan to publish a concise task checklist.");
+        prompt.push_str("\nDo not use update_plan for simple one-step tasks.");
+        prompt.push_str("\nIf you use update_plan, keep it short and update it only when status materially changes.");
         match active_effective_tool_mode(cfg) {
             ToolCallMode::Json => {
                 prompt.push_str("\nTool protocol mode: json.");
@@ -691,6 +694,7 @@ pub fn build_system_prompt(cfg: &Config, mode: &str) -> String {
         prompt.push_str("\n- fs_move args: {from, to}");
         prompt.push_str("\n- fs_delete args: {path, recursive?}");
         prompt.push_str("\n- run_command args: {command} (structured alias of shell)");
+        prompt.push_str("\n- update_plan args: {explanation?, items:[{step, status}...]} where status is pending|in_progress|completed");
         prompt.push_str("\n- shell args: {command} (legacy fallback)");
         prompt.push_str("\nFallback JSON format (only if native functions are not available): {\"tool_calls\":[{\"tool\":\"fs_read_file\",\"args\":{\"path\":\"src/main.rs\"}}]}");
         prompt.push_str("\nKeep each step minimal and verifiable. After tool outputs, either call next tool or provide final answer.");

@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use encoding_rs::GBK;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
@@ -41,7 +41,9 @@ use crate::util::{
     color_rust, color_yellow, prefix_chars, print_startup_banner, render_markdown_terminal, tagged_prompt,
     truncate_preview, truncate_with_suffix,
 };
-const MAX_AUTO_TOOL_STEPS: usize = 3;
+const MAX_AUTO_TOOL_STEPS: usize = 8;
+const MAX_AUTO_NO_PROGRESS_STEPS: usize = 2;
+const MAX_AUTO_REPEAT_TOOL_STEPS: usize = 2;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
 const MAX_INVALID_FORMAT_RETRIES: usize = 2;
@@ -49,7 +51,7 @@ const MAX_WRITE_TASK_RETRIES: usize = 2;
 const MAX_WRITE_CLAIM_RETRIES: usize = 1;
 const MAX_DIFF_PREVIEW_FILES: usize = 20;
 const MAX_FS_PREVIEW_TEXT_BYTES: usize = 1400;
-const MAX_FS_SNAPSHOT_HASH_BYTES: u64 = 1_000_000;
+const MAX_FS_SNAPSHOT_HASH_BYTES: u64 = 10_000_000;
 const STRICT_TOOL_CALL_INSTRUCTION: &str = "You must execute using strict JSON tool_calls only. Allowed format example: {\"tool_calls\":[{\"tool\":\"fs_create_file\",\"args\":{\"path\":\"analysis.md\",\"content\":\"...\"}}]}. Do not output <think>, code_execution, or markdown code fences.";
 const WRITE_TASK_RETRY_MSG: &str = "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result. Use strict JSON tool_calls only.";
 const WRITE_CLAIM_RETRY_MSG: &str = "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute required tool_calls to create/update the target file using strict JSON only.";
@@ -70,6 +72,7 @@ struct DiffPreviewCache {
 
 static DIFF_PREVIEW_CACHE: OnceLock<Mutex<DiffPreviewCache>> = OnceLock::new();
 static FS_BASELINE_SNAPSHOT: OnceLock<Mutex<Option<BTreeMap<String, FsEntry>>>> = OnceLock::new();
+static RUNTIME_ACTIVE_SESSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FsEntry {
@@ -107,6 +110,7 @@ impl ChatExecutionMode {
 
 pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
     let mut active_session = resolve_session_name(session)?;
+    set_runtime_active_session(Some(&active_session));
     let mut exec_mode = ChatExecutionMode::AgentAuto;
     let mut render_markdown = true;
     let mut active_skill = load_active_skill_for_session(&active_session)?;
@@ -412,7 +416,7 @@ async fn submit_file_to_model(
         attachments: Vec::new(),
     });
     maybe_compact_history(history, cfg);
-    let system = build_system_prompt_with_skill(cfg, "review", active_skill)?;
+    let system = build_system_prompt_with_skill(cfg, "review", active_skill, should_suggest_plan(user_request))?;
     run_agent_turn_with_system(cfg, history, &system, None, render_markdown, false).await
 }
 
@@ -836,8 +840,14 @@ fn build_system_prompt_with_skill(
     cfg: &Config,
     mode: &str,
     active_skill: Option<&str>,
+    prefer_plan: bool,
 ) -> Result<String> {
     let mut prompt = build_system_prompt(cfg, mode);
+    if mode == "chat" && prefer_plan {
+        prompt.push_str(
+            "\nThis looks like a multi-step task. Consider using update_plan early if it will help track progress.",
+        );
+    }
     let Some(name) = active_skill.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(prompt);
     };
@@ -870,6 +880,21 @@ fn build_system_prompt_with_skill(
         ));
     }
     Ok(prompt)
+}
+
+fn should_suggest_plan(input: &str) -> bool {
+    let lines = input.lines().count();
+    let lower = input.to_ascii_lowercase();
+    let cn_hits = ["实现", "步骤", "然后", "接着", "最后", "先", "完善", "测试"];
+    let en_hits = ["implement", "then", "next", "finally", "step", "plan", "refactor", "test"];
+    let bullet_like = input.matches('\n').count() >= 2
+        || input.contains("1.")
+        || input.contains("2.")
+        || input.contains("- ")
+        || input.contains("•");
+    let hit_count = cn_hits.iter().filter(|k| input.contains(**k)).count()
+        + en_hits.iter().filter(|k| lower.contains(**k)).count();
+    lines >= 3 || bullet_like || hit_count >= 3
 }
 
 async fn handle_chat_slash_command(
@@ -916,6 +941,7 @@ async fn handle_chat_slash_command(
             c("/prompt use <name>", "switch prompt");
             c("/model list", "list available models");
             c("/model use <name>", "switch model");
+            c("/plan show|clear", "show or clear current session plan");
             c("/skill list|show|use|clear", "manage session skill");
             println!(
                 "{}",
@@ -968,6 +994,7 @@ async fn handle_chat_slash_command(
                     let next_history = load_session_or_default(&next_session)?;
                     *history = next_history;
                     *active_session = next_session.clone();
+                    set_runtime_active_session(Some(active_session));
                     *active_skill = load_active_skill_for_session(&next_session)?;
                     println!(
                         "Switched session: {} ({} messages)",
@@ -1225,6 +1252,23 @@ async fn handle_chat_slash_command(
                 _ => println!("Usage: /model <list|use>"),
             }
         }
+        "/plan" => {
+            let sub = parts.next().unwrap_or("show");
+            match sub {
+                "show" => {
+                    if let Some(plan) = load_plan_for_session(active_session)? {
+                        print!("{}", render_session_plan(&plan));
+                    } else {
+                        println!("No active plan.");
+                    }
+                }
+                "clear" => {
+                    clear_plan_for_session(active_session)?;
+                    println!("Plan cleared.");
+                }
+                _ => println!("Usage: /plan <show|clear>"),
+            }
+        }
         "/skill" => {
             let Some(sub) = parts.next() else {
                 println!("Usage: /skill <list|show|use|clear>");
@@ -1300,6 +1344,36 @@ struct ExecResult {
     had_failures: bool,
     display_text: String,
     history_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanItem {
+    step: String,
+    status: PlanItemStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionPlan {
+    #[serde(default)]
+    explanation: Option<String>,
+    #[serde(default)]
+    items: Vec<PlanItem>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AutoStopState {
+    consecutive_no_progress: usize,
+    consecutive_repeat: usize,
+    last_tool_signature: Option<String>,
+    final_summary_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1588,6 +1662,31 @@ fn native_tool_schemas() -> Vec<Value> {
                 "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
             }
         }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"update_plan",
+                "description":"Create or replace the current session plan with ordered items and statuses",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "explanation":{"type":"string"},
+                        "items":{
+                            "type":"array",
+                            "items":{
+                                "type":"object",
+                                "properties":{
+                                    "step":{"type":"string"},
+                                    "status":{"type":"string","enum":["pending","in_progress","completed"]}
+                                },
+                                "required":["step","status"]
+                            }
+                        }
+                    },
+                    "required":["items"]
+                }
+            }
+        }),
     ]
 }
 
@@ -1697,6 +1796,70 @@ fn serialize_tool_results(results: &[ToolResultRecord]) -> String {
     serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn tool_call_signature(calls: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for call in calls {
+        let name = call
+            .get("tool")
+            .or_else(|| call.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let args = call
+            .get("args")
+            .or_else(|| call.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if name.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}:{}", name, args));
+    }
+    parts.join("|")
+}
+
+fn should_force_final_summary(
+    state: &mut AutoStopState,
+    steps: usize,
+    changed_files: &[String],
+    signature: &str,
+) -> Option<String> {
+    if changed_files.is_empty() {
+        state.consecutive_no_progress += 1;
+    } else {
+        state.consecutive_no_progress = 0;
+    }
+
+    if !signature.is_empty() && state.last_tool_signature.as_deref() == Some(signature) {
+        state.consecutive_repeat += 1;
+    } else {
+        state.consecutive_repeat = 0;
+    }
+    if !signature.is_empty() {
+        state.last_tool_signature = Some(signature.to_string());
+    }
+
+    if steps >= MAX_AUTO_TOOL_STEPS {
+        return Some(format!(
+            "Tool execution reached the limit ({} steps). Stop using tools and provide the final answer now.",
+            MAX_AUTO_TOOL_STEPS
+        ));
+    }
+    if state.consecutive_no_progress >= MAX_AUTO_NO_PROGRESS_STEPS {
+        return Some(format!(
+            "No meaningful progress was detected for {} consecutive tool rounds. Stop using tools and provide the final answer now.",
+            MAX_AUTO_NO_PROGRESS_STEPS
+        ));
+    }
+    if state.consecutive_repeat >= MAX_AUTO_REPEAT_TOOL_STEPS {
+        return Some(format!(
+            "The same tool calls repeated for {} consecutive rounds. Stop using tools and provide the final answer now.",
+            MAX_AUTO_REPEAT_TOOL_STEPS
+        ));
+    }
+    None
+}
+
 fn is_skipped_tool_output(output: &str) -> bool {
     let lower = output.trim().to_ascii_lowercase();
     lower.starts_with("skipped") || lower.starts_with("skip ")
@@ -1728,8 +1891,64 @@ fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String
         "fs.move" | "fs_move" => execute_native_fs_move(call),
         "fs.delete" | "fs_delete" => execute_native_fs_delete(call),
         "run_command" => execute_structured_run_command(cfg, call),
+        "update_plan" => execute_update_plan(call),
         _ => Ok(format!("Skipped unsupported tool: {}", call.tool)),
     }
+}
+
+fn execute_update_plan(call: &ToolCall) -> Result<String> {
+    let Some(session) = runtime_active_session_name() else {
+        return Ok("Skipped update_plan: no active session.".to_string());
+    };
+    let explanation = tool_arg_string(call, &["explanation"]);
+    let items_value = call
+        .args
+        .get("items")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let items = parse_plan_items(&items_value)?;
+    let plan = SessionPlan {
+        explanation,
+        items,
+    };
+    save_plan_for_session(&session, &plan)?;
+    Ok(render_session_plan(&plan))
+}
+
+fn parse_plan_items(value: &Value) -> Result<Vec<PlanItem>> {
+    let Some(items) = value.as_array() else {
+        bail!("update_plan.items must be an array");
+    };
+    if items.len() > 20 {
+        bail!("plan cannot have more than 20 items");
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let step = item
+            .get("step")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("plan item missing step"))?;
+        let status = match item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pending" => PlanItemStatus::Pending,
+            "in_progress" => PlanItemStatus::InProgress,
+            "completed" => PlanItemStatus::Completed,
+            other => bail!("invalid plan status: {}", other),
+        };
+        out.push(PlanItem {
+            step: step.to_string(),
+            status,
+        });
+    }
+    Ok(out)
 }
 
 fn tool_progress_label(call: &ToolCall) -> Option<String> {
@@ -2208,7 +2427,13 @@ async fn run_agent_turn(
 ) -> Result<()> {
     let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
     set_runtime_active_skill(runtime_skill)?;
-    let system = build_system_prompt_with_skill(cfg, mode, active_skill)?;
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let system = build_system_prompt_with_skill(cfg, mode, active_skill, should_suggest_plan(last_user))?;
     let result =
         run_agent_turn_with_system(cfg, history, &system, session, render_markdown, true).await;
     let _ = set_runtime_active_skill(None);
@@ -2285,6 +2510,7 @@ async fn run_agent_turn_with_system_native(
     let mut invalid_format_retries = 0usize;
     let mut write_claim_retries = 0usize;
     let mut write_task_retries = 0usize;
+    let mut auto_stop = AutoStopState::default();
     loop {
         compact_native_messages(&mut messages, cfg.history_max_chars.max(2000));
         println!(
@@ -2398,13 +2624,6 @@ async fn run_agent_turn_with_system_native(
                     )
                 }));
                 steps += 1;
-                if steps > MAX_AUTO_TOOL_STEPS {
-                    println!(
-                        "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                        MAX_AUTO_TOOL_STEPS
-                    );
-                    return Ok(());
-                }
                 continue;
             }
 
@@ -2437,8 +2656,12 @@ async fn run_agent_turn_with_system_native(
             );
             return Ok(());
         }
+        let before_round = current_changed_file_set().unwrap_or_default();
         let (exec_result, tool_msgs) = execute_native_function_calls(cfg, &resp.tool_calls)?;
+        let after_round = current_changed_file_set().unwrap_or_default();
+        let changed_round = changed_files_delta(&before_round, &after_round);
         let native_calls = native_calls_to_values(&resp.tool_calls, cfg, session);
+        let signature = tool_call_signature(&native_calls);
         record_step_artifact_from_native(
             session,
             cfg,
@@ -2470,12 +2693,21 @@ async fn run_agent_turn_with_system_native(
                 )
             }));
             steps += 1;
-            if steps >= MAX_AUTO_TOOL_STEPS {
-                println!(
-                    "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                    MAX_AUTO_TOOL_STEPS
-                );
-                return Ok(());
+            if let Some(stop_msg) =
+                should_force_final_summary(&mut auto_stop, steps, &changed_round, &signature)
+            {
+                if auto_stop.final_summary_requested {
+                    println!("assistant> {}", truncate_with_suffix(&stop_msg, 220, " ..."));
+                    return Ok(());
+                }
+                auto_stop.final_summary_requested = true;
+                messages.push(json!({
+                    "role":"user",
+                    "content": format!(
+                        "{}\nDo not call any more tools. Reply with the final answer only: concise summary, changed files, and verification result.",
+                        stop_msg
+                    )
+                }));
             }
             continue;
         }
@@ -2525,6 +2757,7 @@ async fn run_agent_turn_with_system_legacy(
     let mut invalid_format_retries = 0usize;
     let mut write_claim_retries = 0usize;
     let mut write_task_retries = 0usize;
+    let mut auto_stop = AutoStopState::default();
     loop {
         maybe_compact_history(history, cfg);
         println!(
@@ -2556,7 +2789,10 @@ async fn run_agent_turn_with_system_legacy(
             println!("{}", render_markdown_terminal(&answer, render_markdown));
             println!("\n");
         }
+        let before_round = current_changed_file_set().unwrap_or_default();
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
+        let after_round = current_changed_file_set().unwrap_or_default();
+        let changed_round = changed_files_delta(&before_round, &after_round);
         let last_user = history
             .iter()
             .rev()
@@ -2564,6 +2800,7 @@ async fn run_agent_turn_with_system_legacy(
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let parsed_calls = tool_calls_from_text(&answer);
+        let signature = tool_call_signature(&parsed_calls);
         record_step_artifact(
             session,
             cfg,
@@ -2655,12 +2892,22 @@ async fn run_agent_turn_with_system_legacy(
                 attachments: Vec::new(),
             });
             steps += 1;
-            if steps > MAX_AUTO_TOOL_STEPS {
-                println!(
-                    "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                    MAX_AUTO_TOOL_STEPS
-                );
-                return Ok(());
+            if let Some(stop_msg) =
+                should_force_final_summary(&mut auto_stop, steps, &changed_round, &signature)
+            {
+                if auto_stop.final_summary_requested {
+                    println!("assistant> {}", truncate_with_suffix(&stop_msg, 220, " ..."));
+                    return Ok(());
+                }
+                auto_stop.final_summary_requested = true;
+                history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "{}\nDo not call any more tools. Reply with the final answer only: concise summary, changed files, and verification result.",
+                        stop_msg
+                    ),
+                    attachments: Vec::new(),
+                });
             }
             continue;
         }
@@ -3024,7 +3271,13 @@ async fn run_chat_turn(
 ) -> Result<()> {
     let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
     set_runtime_active_skill(runtime_skill)?;
-    let mut system = build_system_prompt_with_skill(cfg, mode, active_skill)?;
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let mut system = build_system_prompt_with_skill(cfg, mode, active_skill, should_suggest_plan(last_user))?;
     maybe_compact_history(history, cfg);
     println!("{}", color_dim("(phase: response)"));
     print!(
@@ -3835,45 +4088,14 @@ fn is_trusted_command(cfg: &Config, cmd: &str) -> bool {
 }
 
 fn command_prefix(cmd: &str) -> String {
-    let first_segment = split_first_command_segment(cmd).trim();
-    let tokens: Vec<&str> = first_segment.split_whitespace().collect();
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let token = tokens[i].trim_matches(|c: char| matches!(c, '(' | ')' | '{' | '}'));
-        if token.is_empty() {
-            i += 1;
-            continue;
-        }
-        if token == "&" || token == "." {
-            i += 1;
-            continue;
-        }
-        if token.starts_with('$') {
-            if i + 1 < tokens.len() && tokens[i + 1] == "=" {
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if token.eq_ignore_ascii_case("git")
-            && let Some(second) = tokens.get(i + 1)
-        {
-            return format!("git {}", second);
-        }
-        return token.to_string();
+    let mut it = cmd.split_whitespace();
+    let first = it.next().unwrap_or("").to_string();
+    if first.eq_ignore_ascii_case("git")
+        && let Some(second) = it.next()
+    {
+        return format!("git {}", second);
     }
-    cmd.split_whitespace().next().unwrap_or("").to_string()
-}
-
-fn split_first_command_segment(cmd: &str) -> &str {
-    let mut cut = cmd.len();
-    for pat in ["&&", "||", ";", "|"] {
-        if let Some(idx) = cmd.find(pat) {
-            cut = cut.min(idx);
-        }
-    }
-    &cmd[..cut]
+    first
 }
 
 fn is_safe_auto_exec_command(cmd: &str) -> bool {
@@ -4064,6 +4286,12 @@ fn session_path(session: &str) -> Result<std::path::PathBuf> {
         .join(format!("{session}.json")))
 }
 
+fn plan_path(session: &str) -> Result<std::path::PathBuf> {
+    Ok(config_dir()?
+        .join("sessions")
+        .join(format!("{session}.plan.json")))
+}
+
 fn sessions_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("sessions"))
 }
@@ -4117,6 +4345,18 @@ fn sanitize_session_name(name: &str) -> String {
     }
 }
 
+fn set_runtime_active_session(session: Option<&str>) {
+    let lock = RUNTIME_ACTIVE_SESSION.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = session.map(|s| s.to_string());
+    }
+}
+
+fn runtime_active_session_name() -> Option<String> {
+    let lock = RUNTIME_ACTIVE_SESSION.get_or_init(|| Mutex::new(None));
+    lock.lock().ok().and_then(|guard| guard.clone())
+}
+
 fn load_session_or_default(session: &str) -> Result<Vec<ChatMessage>> {
     let path = session_path(session)?;
     if !path.exists() {
@@ -4134,6 +4374,58 @@ fn load_session_or_default(session: &str) -> Result<Vec<ChatMessage>> {
         })
         .collect();
     Ok(repaired)
+}
+
+fn load_plan_for_session(session: &str) -> Result<Option<SessionPlan>> {
+    let path = plan_path(session)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let plan: SessionPlan =
+        serde_json::from_str(&text).with_context(|| format!("Invalid plan JSON: {}", path.display()))?;
+    Ok(Some(plan))
+}
+
+fn save_plan_for_session(session: &str, plan: &SessionPlan) -> Result<()> {
+    let path = plan_path(session)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create session dir {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(plan)?;
+    fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn clear_plan_for_session(session: &str) -> Result<()> {
+    let path = plan_path(session)?;
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn render_session_plan(plan: &SessionPlan) -> String {
+    let mut out = String::new();
+    out.push_str("✢ Current Plan\n");
+    if let Some(explanation) = plan.explanation.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("  {}\n", explanation));
+    }
+    if plan.items.is_empty() {
+        out.push_str("  (empty)\n");
+        return out;
+    }
+    for item in &plan.items {
+        let mark = match item.status {
+            PlanItemStatus::Completed => "◼",
+            PlanItemStatus::InProgress => "✢",
+            PlanItemStatus::Pending => "◻",
+        };
+        out.push_str(&format!("  {} {}\n", mark, item.step));
+    }
+    out
 }
 
 fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
@@ -4157,6 +4449,7 @@ fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
 
 pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Result<()> {
     let active_session = resolve_session_name(session)?;
+    set_runtime_active_session(Some(&active_session));
     println!("== dongshan agent ({active_session}) ==");
     let mut history = load_session_or_default(&active_session)?;
     let augmented_input = augment_user_input_with_workspace_context(task)?;
@@ -4214,6 +4507,18 @@ fn print_status(cfg: &Config) -> Result<()> {
             cfg.fallback_models.join(", ")
         }
     );
+    if let Some(session) = runtime_active_session_name() {
+        if let Some(plan) = load_plan_for_session(&session)? {
+            let in_progress = plan
+                .items
+                .iter()
+                .filter(|item| matches!(item.status, PlanItemStatus::InProgress))
+                .count();
+            println!("plan_items: {} (in_progress: {})", plan.items.len(), in_progress);
+        } else {
+            println!("plan_items: 0");
+        }
+    }
     let changed = list_workspace_changed_files()?;
     println!("changed_files: {}", changed.len());
     for p in changed.iter().take(8) {
@@ -4714,4 +5019,83 @@ fn looks_more_readable_chinese(candidate: &str, original: &str) -> bool {
         common * 2 - weird * 2 - replacement * 3
     }
     score(candidate) > score(original)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_call_signature() {
+        let calls = vec![
+            json!({"tool": "read", "args": {"path": "test.rs"}}),
+            json!({"tool": "write", "args": {"path": "out.rs"}}),
+        ];
+        let sig = tool_call_signature(&calls);
+        assert!(sig.contains("read"));
+        assert!(sig.contains("write"));
+    }
+
+    #[test]
+    fn test_should_force_final_summary_max_steps() {
+        let mut state = AutoStopState::default();
+        let result = should_force_final_summary(&mut state, 12, &[], "");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_should_force_final_summary_no_progress() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &[], "sig1");
+        let result = should_force_final_summary(&mut state, 2, &[], "sig2");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_should_force_final_summary_repeat() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &["file.rs".to_string()], "sig");
+        should_force_final_summary(&mut state, 2, &["file.rs".to_string()], "sig");
+        let result = should_force_final_summary(&mut state, 3, &["file.rs".to_string()], "sig");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_command_prefix() {
+        assert_eq!(command_prefix("ls -la"), "ls");
+        assert_eq!(command_prefix("git status"), "git status");
+        assert_eq!(command_prefix("git commit -m 'test'"), "git commit");
+        assert_eq!(command_prefix(""), "");
+    }
+
+    #[test]
+    fn test_parse_plan_items_limit() {
+        let items = (0..21).map(|i| json!({"step": format!("step{}", i)})).collect::<Vec<_>>();
+        let result = parse_plan_items(&json!(items));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("20"));
+    }
+
+    #[test]
+    fn test_parse_plan_items_valid() {
+        let items = vec![
+            json!({"step": "first", "status": "pending"}),
+            json!({"step": "second", "status": "in_progress"}),
+        ];
+        let result = parse_plan_items(&json!(items)).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_call_signature_empty() {
+        assert_eq!(tool_call_signature(&[]), "");
+    }
+
+    #[test]
+    fn test_should_force_final_summary_progress_resets() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &[], "sig1");
+        let result = should_force_final_summary(&mut state, 2, &["file.rs".to_string()], "sig2");
+        assert!(result.is_none());
+    }
 }
