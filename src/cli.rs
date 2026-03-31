@@ -48,21 +48,21 @@ pub enum Commands {
         command: PromptCommand,
     },
     /// Manage available models and active model
-    Models {
+    Model {
         #[command(subcommand)]
-        command: ModelsCommand,
+        command: ModelCommand,
     },
     /// Manage local skills and session skill binding
-    Skill {
+    Skills {
         #[command(subcommand)]
-        command: SkillCommand,
+        command: SkillsCommand,
     },
     /// Diagnose current model/profile/network health
     Doctor,
     /// Basic file system tools (read/list/grep)
-    Fs {
+    Files {
         #[command(subcommand)]
-        command: FsCommand,
+        command: FilesCommand,
     },
     /// Review a single file with AI
     Review {
@@ -83,6 +83,14 @@ pub enum Commands {
         #[arg(long)]
         apply: bool,
     },
+    /// Placeholder for Claude-style permissions management
+    Permissions,
+    /// Placeholder for Claude-style task orchestration
+    Tasks,
+    /// Placeholder for Claude-style session resume
+    Resume,
+    /// Placeholder for Claude-style planning mode
+    Plan,
 }
 
 #[derive(Subcommand, Debug)]
@@ -169,7 +177,7 @@ pub enum PromptCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum FsCommand {
+pub enum FilesCommand {
     /// Read a text file
     Read { file: PathBuf },
     /// Recursively list files under a path
@@ -186,7 +194,7 @@ pub enum FsCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ModelsCommand {
+pub enum ModelCommand {
     /// List saved model catalog and current active model
     List,
     /// Use one model as current active model
@@ -226,7 +234,7 @@ pub enum ModelsCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum SkillCommand {
+pub enum SkillsCommand {
     /// List available skills
     List,
     /// Show one skill manifest and prompt preview

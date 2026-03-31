@@ -11,7 +11,7 @@
 - Prompt 保存、切换、变量模板
 - 本地 Web 控制台（`dongshan web`）管理配置/模型/Prompt/执行策略
 - `chat` 自然语言工具路由
-- `/new`、`/read`、`/grep` 等斜杠命令
+- Claude 风格聊天 TUI 斜杠命令，例如 `/model`、`/skills`、`/files`、`/plan`
 - Agent 循环：根据策略自动执行命令块并回喂模型
 - 仅对 `bash/sh/powershell/pwsh/cmd` 代码块做命令执行解析
 - 对“非默认信任命令”执行前询问，可一键设为默认信任前缀
@@ -185,9 +185,9 @@ http://127.0.0.1:3721
 - `/session use <name>`
 - `/session rm <name>`
 - `/mode show|chat|agent-auto|agent-force`
-- `/read <file>`
-- `/list [path]`
-- `/grep <pattern> [path]`
+- `/files read <path>`
+- `/files list [path]`
+- `/files grep <pattern> [path]`
 - `/prompt show|list|use <name>`
 - `/model list`
 - `/model use <name>`
@@ -308,7 +308,7 @@ dongshan config set --auto-check-update false
 
 ## 配置文件
 
-路径：`~/.dongshan/config.toml`
+路径：`~/.dongshan/settings.toml`
 
 示例：
 
@@ -357,22 +357,22 @@ executor_model = "grok-4-1-fast-non-reasoning"  # 可靠的工具执行模型
 ## 模型命令
 
 ```powershell
-dongshan models list
-dongshan models add grok-code-fast-1
-dongshan models use grok-code-fast-1
-dongshan models remove old-model-name
-dongshan models show
-dongshan models show grok-code-fast-1
-dongshan models set-profile grok-code-fast-1 --base-url "https://api.x.ai/v1/chat/completions" --api-key-env "XAI_API_KEY"
+dongshan model list
+dongshan model add grok-code-fast-1
+dongshan model use grok-code-fast-1
+dongshan model remove old-model-name
+dongshan model show
+dongshan model show grok-code-fast-1
+dongshan model set-profile grok-code-fast-1 --base-url "https://api.x.ai/v1/chat/completions" --api-key-env "XAI_API_KEY"
 ```
 
 自定义模型（自定义 API 地址和 Key 环境变量）：
 
 ```powershell
-dongshan models add my-openai-compatible `
+dongshan model add my-openai-compatible `
   --base-url "https://your-gateway.example.com/v1/chat/completions" `
   --api-key-env "MY_GATEWAY_KEY"
-dongshan models use my-openai-compatible
+dongshan model use my-openai-compatible
 ```
 
 ## Doctor 健康检查
@@ -405,34 +405,34 @@ dongshan doctor
 dongshan config set --history-max-messages 24 --history-max-chars 50000
 ```
 ## `dongshan chat` 里的核心指令
-### `/read <file>`
+### `/files read <file>`
 - 直接读取并打印文件内容。
 - 不会让模型分析。
 
 示例：
 ```text
-/read README.md
-/read src/chat.rs
+/files read README.md
+/files read src/chat.rs
 ```
 
-### `/list [path]`
+### `/files list [path]`
 - 列出目录下文件。
 - 优先使用 `rg --files`，不可用时回退递归列举。
 
 示例：
 ```text
-/list
-/list src
+/files list
+/files list src
 ```
 
-### `/grep <pattern> [path]`
+### `/files grep <pattern> [path]`
 - 在路径下搜索文本。
 - 优先使用 `rg`，不可用时回退内置递归搜索。
 
 示例：
 ```text
-/grep WorkingStatus src
-/grep "read_text_file" src
+/files grep WorkingStatus src
+/files grep "read_text_file" src
 ```
 
 ### `/askfile <file> <question>`
@@ -466,23 +466,23 @@ dongshan config set --history-max-messages 24 --history-max-chars 50000
 
 ## 4) 何时用哪个
 
-- 快速看原文：`/read`
-- 看目录结构：`/list`
-- 定位关键字：`/grep`
+- 快速看原文：`/files read`
+- 看目录结构：`/files list`
+- 定位关键字：`/files grep`
 - 读完并解释：`/askfile`
 
 ## 5) 使用注意事项
 
 - 路径有空格时请加引号。
-- `/read` 只打印，不会自动总结。
+- `/files read` 只打印，不会自动总结。
 - 要分析请用 `/askfile` 或继续追问。
 - 出现 `Request interrupted` 不用退出 chat，直接发下一条即可。
 
 ## 6) 快速模板
 
 ```text
-/list src
-/grep "Failed to read stream chunk" src
-/read src/llm.rs
+/files list src
+/files grep "Failed to read stream chunk" src
+/files read src/llm.rs
 /askfile src/llm.rs 解释超时路径并给出修改建议
 ```

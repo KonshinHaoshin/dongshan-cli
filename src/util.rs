@@ -100,7 +100,7 @@ pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
         println!(
             "  {}  {}",
             color_bold(&color_rust("dongshan")),
-            color_dim("v0.2.0  ·  AI Coding Assistant")
+            color_dim("v0.2.1  ·  AI Coding Assistant")
         );
         println!("  {}", color_rust(&sep));
         println!("  {}  {}", color_dim("session :"), color_cyan(session));
@@ -115,7 +115,7 @@ pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
         for line in FERRIS.trim_matches('\n').lines() {
             println!("{}", line);
         }
-        println!("  dongshan v0.2.0  ·  AI Coding Assistant");
+        println!("  dongshan v0.2.1  ·  AI Coding Assistant");
         println!("  {}", sep);
         println!(
             "  session : {}  model : {}  mode : {}",

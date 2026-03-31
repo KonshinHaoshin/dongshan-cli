@@ -1,16 +1,13 @@
 use anyhow::{Result, bail};
 
-use crate::cli::SkillCommand;
-use crate::skills::{
-    find_skill, load_active_skill_for_session, load_skills, resolve_session_name,
-    save_active_skill_for_session,
-};
+use crate::cli::SkillsCommand;
+use crate::services::skills as skills_service;
 use crate::util::truncate_preview;
 
-pub fn handle_skill(command: SkillCommand) -> Result<()> {
+pub fn handle_skills(command: SkillsCommand) -> Result<()> {
     match command {
-        SkillCommand::List => {
-            let skills = load_skills()?;
+        SkillsCommand::List => {
+            let skills = skills_service::load_all()?;
             if skills.is_empty() {
                 println!("No skills found.");
                 return Ok(());
@@ -25,8 +22,8 @@ pub fn handle_skill(command: SkillCommand) -> Result<()> {
                 println!("- {}: {}", skill.manifest.name, desc);
             }
         }
-        SkillCommand::Show { name } => {
-            let Some(skill) = find_skill(&name)? else {
+        SkillsCommand::Show { name } => {
+            let Some(skill) = skills_service::find(&name)? else {
                 bail!("Skill not found: {}", name);
             };
             println!("Skill: {}", skill.manifest.name);
@@ -45,25 +42,25 @@ pub fn handle_skill(command: SkillCommand) -> Result<()> {
                 println!("  prompt: {}", truncate_preview(&skill.prompt_text, 240));
             }
         }
-        SkillCommand::Use { name, session } => {
-            let Some(skill) = find_skill(&name)? else {
+        SkillsCommand::Use { name, session } => {
+            let Some(skill) = skills_service::find(&name)? else {
                 bail!("Skill not found: {}", name);
             };
-            let session = resolve_session_name(&session)?;
-            save_active_skill_for_session(&session, Some(&skill.manifest.name))?;
+            let session = skills_service::resolve_session_name(&session)?;
+            skills_service::save_active_for_session(&session, Some(&skill.manifest.name))?;
             println!(
                 "Active skill for session '{}' set to '{}'.",
                 session, skill.manifest.name
             );
         }
-        SkillCommand::Clear { session } => {
-            let session = resolve_session_name(&session)?;
-            save_active_skill_for_session(&session, None)?;
+        SkillsCommand::Clear { session } => {
+            let session = skills_service::resolve_session_name(&session)?;
+            skills_service::save_active_for_session(&session, None)?;
             println!("Active skill cleared for session '{}'.", session);
         }
-        SkillCommand::Current { session } => {
-            let session = resolve_session_name(&session)?;
-            match load_active_skill_for_session(&session)? {
+        SkillsCommand::Current { session } => {
+            let session = skills_service::resolve_session_name(&session)?;
+            match skills_service::load_active_for_session(&session)? {
                 Some(name) => println!("Active skill for session '{}': {}", session, name),
                 None => println!("Active skill for session '{}': (none)", session),
             }

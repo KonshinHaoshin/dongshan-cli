@@ -308,7 +308,7 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("config.toml"))
+    Ok(config_dir()?.join("settings.toml"))
 }
 
 pub fn load_config_or_default() -> Result<Config> {
