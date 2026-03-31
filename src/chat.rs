@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use encoding_rs::GBK;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chat_context::augment_user_input_with_workspace_context;
@@ -27,16 +27,23 @@ use crate::fs_tools::{
     try_rg_files, try_rg_grep,
 };
 use crate::llm::{
-    ChatMessage, NativeFunctionCall, build_openai_messages, call_llm_with_history,
+    ChatAttachment, ChatMessage, NativeFunctionCall, build_openai_messages,
+    call_llm_with_history_json_object,
     call_llm_with_history_stream_tools, call_llm_with_messages_native_tools,
 };
 use crate::prompt_store::list_prompt_names;
+use crate::skills::{
+    find_skill, load_active_skill_for_session, load_skills, pick_skill_for_input,
+    runtime_active_skill, save_active_skill_for_session, set_runtime_active_skill,
+};
 use crate::util::{
     WorkingStatus, ask, ask_or_eof, color_blue, color_cyan, color_dim, color_green, color_red,
     color_rust, color_yellow, prefix_chars, print_startup_banner, render_markdown_terminal, tagged_prompt,
     truncate_preview, truncate_with_suffix,
 };
-const MAX_AUTO_TOOL_STEPS: usize = 3;
+const MAX_AUTO_TOOL_STEPS: usize = 8;
+const MAX_AUTO_NO_PROGRESS_STEPS: usize = 2;
+const MAX_AUTO_REPEAT_TOOL_STEPS: usize = 2;
 const MAX_COMMANDS_PER_RESPONSE: usize = 8;
 const MAX_FAILED_COMMANDS_PER_RESPONSE: usize = 2;
 const MAX_INVALID_FORMAT_RETRIES: usize = 2;
@@ -44,10 +51,18 @@ const MAX_WRITE_TASK_RETRIES: usize = 2;
 const MAX_WRITE_CLAIM_RETRIES: usize = 1;
 const MAX_DIFF_PREVIEW_FILES: usize = 20;
 const MAX_FS_PREVIEW_TEXT_BYTES: usize = 1400;
-const MAX_FS_SNAPSHOT_HASH_BYTES: u64 = 1_000_000;
+const MAX_FS_SNAPSHOT_HASH_BYTES: u64 = 10_000_000;
 const STRICT_TOOL_CALL_INSTRUCTION: &str = "You must execute using strict JSON tool_calls only. Allowed format example: {\"tool_calls\":[{\"tool\":\"fs_create_file\",\"args\":{\"path\":\"analysis.md\",\"content\":\"...\"}}]}. Do not output <think>, code_execution, or markdown code fences.";
 const WRITE_TASK_RETRY_MSG: &str = "The user asked you to create or modify files. Do not ask the user to save manually. You must execute tool_calls to write files in workspace, then report result. Use strict JSON tool_calls only.";
 const WRITE_CLAIM_RETRY_MSG: &str = "You claimed file creation/update, but no file changes were detected. Do not claim success unless a real tool call has executed and changed files. Now execute required tool_calls to create/update the target file using strict JSON only.";
+
+fn user_visible_write_fail() -> &'static str {
+    "No real file changes were applied."
+}
+
+fn user_visible_manual_delegation() -> &'static str {
+    "This reply only described manual edits; it did not modify files."
+}
 
 #[derive(Default, Clone)]
 struct DiffPreviewCache {
@@ -57,6 +72,7 @@ struct DiffPreviewCache {
 
 static DIFF_PREVIEW_CACHE: OnceLock<Mutex<DiffPreviewCache>> = OnceLock::new();
 static FS_BASELINE_SNAPSHOT: OnceLock<Mutex<Option<BTreeMap<String, FsEntry>>>> = OnceLock::new();
+static RUNTIME_ACTIVE_SESSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FsEntry {
@@ -94,8 +110,10 @@ impl ChatExecutionMode {
 
 pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
     let mut active_session = resolve_session_name(session)?;
+    set_runtime_active_session(Some(&active_session));
     let mut exec_mode = ChatExecutionMode::AgentAuto;
     let mut render_markdown = true;
+    let mut active_skill = load_active_skill_for_session(&active_session)?;
     print_startup_banner(&active_session, &cfg.model, exec_mode.as_str());
     let mut history = load_session_or_default(&active_session)?;
     loop {
@@ -119,6 +137,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 &mut active_session,
                 &mut exec_mode,
                 &mut render_markdown,
+                &mut active_skill,
             )
             .await?;
             save_session(&active_session, &history)?;
@@ -126,11 +145,20 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
             continue;
         }
 
+        let turn_skill = match active_skill.as_deref() {
+            Some(name) => find_skill(name)?,
+            None => pick_skill_for_input(input.trim())?,
+        };
+        if active_skill.is_none() && let Some(skill) = &turn_skill {
+            println!("assistant> Activated skill: {}", skill.manifest.name);
+        }
+
         if handle_natural_language_tool_command(
             input.trim(),
             &mut cfg,
             &mut history,
             render_markdown,
+            turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
         )
         .await?
         {
@@ -151,6 +179,7 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
         history.push(ChatMessage {
             role: "user".to_string(),
             content: augmented_input,
+            attachments: Vec::new(),
         });
 
         maybe_compact_history(&mut history, &cfg);
@@ -161,10 +190,18 @@ pub async fn run_chat(mut cfg: Config, session: &str) -> Result<()> {
                 "chat",
                 Some(&active_session),
                 render_markdown,
+                turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
             )
             .await?;
         } else {
-            run_chat_turn(&mut cfg, &mut history, "chat-lite", render_markdown).await?;
+            run_chat_turn(
+                &mut cfg,
+                &mut history,
+                "chat-lite",
+                render_markdown,
+                turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+            )
+            .await?;
         }
         save_session(&active_session, &history)?;
         print_changed_files_delta(&changed_before)?;
@@ -178,6 +215,7 @@ async fn handle_natural_language_tool_command(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<bool> {
     let lower = input.to_lowercase();
 
@@ -190,7 +228,7 @@ async fn handle_natural_language_tool_command(
             } else {
                 "(stored)".to_string()
             };
-            out.push_str(&format!("- {}: {}\n", name, preview));
+            out.push_str(&format!("- {name}: {preview}\n"));
         }
         println!("{out}");
         push_tool_result(history, input, "prompt.list", &out);
@@ -208,7 +246,7 @@ async fn handle_natural_language_tool_command(
         }
         cfg.active_prompt = name.clone();
         save_config(cfg)?;
-        let out = format!("Active prompt switched to '{}'.", name);
+        let out = format!("Active prompt switched to '{name}'.");
         println!("{out}");
         push_tool_result(history, input, "prompt.use", &out);
         return Ok(true);
@@ -240,39 +278,47 @@ async fn handle_natural_language_tool_command(
     if let Some(name) = parse_model_use(input, &lower) {
         ensure_model_catalog(cfg);
         if !cfg.model_catalog.iter().any(|m| m == &name) {
-            println!("Model not found in catalog: {}", name);
+            println!("Model not found in catalog: {name}");
             return Ok(true);
         }
         set_active_model(cfg, &name);
         save_config(cfg)?;
-        let out = format!("Active model switched to '{}'.", name);
+        let out = format!("Active model switched to '{name}'.");
         println!("{out}");
         push_tool_result(history, input, "model.use", &out);
         return Ok(true);
     }
 
-    if let Some(path) = extract_existing_file_path(input) {
-        if !is_read_request(input, &lower)
-            && !is_list_request(input, &lower)
-            && !is_grep_request(input, &lower)
-        {
-            submit_file_to_model(cfg, history, input, &path, render_markdown).await?;
-            return Ok(true);
-        }
+    if let Some(path) = extract_existing_file_path(input)
+        && should_auto_inspect_path(input, &lower)
+        && !is_list_request(input, &lower)
+        && !is_grep_request(input, &lower)
+    {
+        inspect_path_reference(
+            cfg,
+            history,
+            input,
+            &path,
+            render_markdown,
+            active_skill,
+            has_followup_analysis_intent(input, &lower),
+        )
+        .await?;
+        return Ok(true);
     }
 
     if is_read_request(input, &lower) {
         if let Some(path) = extract_path(input) {
-            if has_followup_analysis_intent(input, &lower) {
-                submit_file_to_model(cfg, history, input, &path, render_markdown).await?;
-            } else {
-                let content = read_text_file(Path::new(&path))?;
-                push_tool_result(history, input, "fs.read", &clip_output(&content, 8000));
-                println!(
-                    "Read {} (content hidden). Ask a follow-up question to analyze it.",
-                    path
-                );
-            }
+            inspect_path_reference(
+                cfg,
+                history,
+                input,
+                &path,
+                render_markdown,
+                active_skill,
+                has_followup_analysis_intent(input, &lower),
+            )
+            .await?;
             return Ok(true);
         }
     }
@@ -303,12 +349,53 @@ async fn handle_natural_language_tool_command(
     Ok(false)
 }
 
+async fn inspect_path_reference(
+    cfg: &mut Config,
+    history: &mut Vec<ChatMessage>,
+    user_input: &str,
+    path: &str,
+    render_markdown: bool,
+    active_skill: Option<&str>,
+    analyze: bool,
+) -> Result<()> {
+    let target = Path::new(path);
+    if !target.exists() {
+        println!("Path not found: {path}");
+        push_tool_result(history, user_input, "fs.path", &format!("Path not found: {path}"));
+        return Ok(());
+    }
+    if target.is_dir() {
+        let out = list_files_output(target)?;
+        print!("{out}");
+        push_tool_result(history, user_input, "fs.list", &clip_output(&out, 8000));
+        return Ok(());
+    }
+    if is_probably_binary_file(target) {
+        let summary = describe_path_metadata(target)?;
+        println!("{summary}");
+        push_tool_result(history, user_input, "fs.stat", &summary);
+        return Ok(());
+    }
+    if analyze {
+        submit_file_to_model(cfg, history, user_input, path, render_markdown, active_skill).await?;
+        return Ok(());
+    }
+    let content = read_text_file(target)?;
+    push_tool_result(history, user_input, "fs.read", &clip_output(&content, 8000));
+    println!(
+        "Read {} (content hidden). Ask a follow-up question to analyze it.",
+        path
+    );
+    Ok(())
+}
+
 async fn submit_file_to_model(
     cfg: &mut Config,
     history: &mut Vec<ChatMessage>,
     user_request: &str,
     path: &str,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
     let content = read_text_file(Path::new(path))?;
     let ext = Path::new(path)
@@ -326,9 +413,10 @@ async fn submit_file_to_model(
     history.push(ChatMessage {
         role: "user".to_string(),
         content: prompt,
+        attachments: Vec::new(),
     });
     maybe_compact_history(history, cfg);
-    let system = build_system_prompt(cfg, "review");
+    let system = build_system_prompt_with_skill(cfg, "review", active_skill, should_suggest_plan(user_request))?;
     run_agent_turn_with_system(cfg, history, &system, None, render_markdown, false).await
 }
 
@@ -347,15 +435,66 @@ fn push_tool_result(history: &mut Vec<ChatMessage>, user_input: &str, tool: &str
     history.push(ChatMessage {
         role: "user".to_string(),
         content: user_input.to_string(),
+        attachments: Vec::new(),
     });
     history.push(ChatMessage {
         role: "assistant".to_string(),
         content: format!("tool[{tool}] output:\n{output}"),
+        attachments: Vec::new(),
     });
 }
 
 fn clip_output(text: &str, max_len: usize) -> String {
     truncate_with_suffix(text, max_len, "...\n[truncated]")
+}
+
+fn read_clipboard_image_attachment() -> Result<Option<ChatAttachment>> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 3 }
+$img = [System.Windows.Forms.Clipboard]::GetImage()
+$ms = New-Object System.IO.MemoryStream
+$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+Write-Output ('data:image/png;base64,' + $b64)
+"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-STA", "-Command", script])
+            .output()
+            .context("failed to invoke powershell clipboard reader")?;
+        match output.status.code() {
+            Some(3) => return Ok(None),
+            Some(0) => {}
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                bail!(
+                    "clipboard image reader failed{}",
+                    if stderr.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(": {}", stderr)
+                    }
+                );
+            }
+        }
+        let data_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if data_url.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(ChatAttachment {
+            kind: "image".to_string(),
+            media_type: "image/png".to_string(),
+            data_url,
+        }));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        bail!("clipboard image paste is currently implemented for Windows terminals only");
+    }
 }
 
 fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
@@ -386,6 +525,7 @@ fn maybe_compact_history(history: &mut Vec<ChatMessage>, cfg: &Config) {
     compacted.push(ChatMessage {
         role: "assistant".to_string(),
         content: format!("[session-summary]\n{}", summary),
+        attachments: Vec::new(),
     });
     compacted.extend_from_slice(&history[split_at..]);
     *history = compacted;
@@ -609,6 +749,74 @@ fn extract_existing_file_path(input: &str) -> Option<String> {
     None
 }
 
+fn should_auto_inspect_path(input: &str, lower: &str) -> bool {
+    is_read_request(input, lower)
+        || lower.contains("analyze ")
+        || lower.contains("open ")
+        || lower.contains("check ")
+        || input.contains("分析")
+        || input.contains("读取")
+        || input.contains("查看")
+        || input.contains("打开")
+        || input.contains("检查")
+        || input.contains("看看")
+}
+
+fn is_probably_binary_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "ttf"
+            | "otf"
+            | "woff"
+            | "woff2"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "ico"
+            | "pdf"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "7z"
+            | "dll"
+            | "exe"
+            | "so"
+            | "bin"
+    ) {
+        return true;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    bytes.iter().take(512).any(|b| *b == 0)
+}
+
+fn describe_path_metadata(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("Failed to read metadata {}", path.display()))?;
+    let kind = if meta.is_dir() { "directory" } else { "binary or non-text file" };
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "{}: {}\nsize: {} bytes\nmodified_unix: {}",
+        kind,
+        path.display(),
+        meta.len(),
+        modified
+    ))
+}
+
 fn extract_quoted(input: &str) -> Option<String> {
     let start = input.find('"').or_else(|| input.find('\''))?;
     let quote = input.chars().nth(start)?;
@@ -628,6 +836,67 @@ fn first_token(s: &str) -> String {
     s.split_whitespace().next().unwrap_or("").to_string()
 }
 
+fn build_system_prompt_with_skill(
+    cfg: &Config,
+    mode: &str,
+    active_skill: Option<&str>,
+    prefer_plan: bool,
+) -> Result<String> {
+    let mut prompt = build_system_prompt(cfg, mode);
+    if mode == "chat" && prefer_plan {
+        prompt.push_str(
+            "\nThis looks like a multi-step task. Consider using update_plan early if it will help track progress.",
+        );
+    }
+    let Some(name) = active_skill.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(prompt);
+    };
+    if let Some(skill) = find_skill(name)? {
+        prompt.push_str("\nActive skill:");
+        prompt.push_str(&format!("\n- name: {}", skill.manifest.name));
+        if !skill.manifest.description.trim().is_empty() {
+            prompt.push_str(&format!("\n- description: {}", skill.manifest.description));
+        }
+        if !skill.manifest.allowed_tools.is_empty() {
+            prompt.push_str(&format!(
+                "\n- preferred_tools: {}",
+                skill.manifest.allowed_tools.join(", ")
+            ));
+        }
+        if !skill.manifest.trusted_commands.is_empty() {
+            prompt.push_str(&format!(
+                "\n- trusted_commands: {}",
+                skill.manifest.trusted_commands.join(", ")
+            ));
+        }
+        if !skill.prompt_text.trim().is_empty() {
+            prompt.push_str("\nSkill instructions:\n");
+            prompt.push_str(&skill.prompt_text);
+        }
+    } else {
+        prompt.push_str(&format!(
+            "\nRequested active skill '{}' was not found. Continue without it.",
+            name
+        ));
+    }
+    Ok(prompt)
+}
+
+fn should_suggest_plan(input: &str) -> bool {
+    let lines = input.lines().count();
+    let lower = input.to_ascii_lowercase();
+    let cn_hits = ["实现", "步骤", "然后", "接着", "最后", "先", "完善", "测试"];
+    let en_hits = ["implement", "then", "next", "finally", "step", "plan", "refactor", "test"];
+    let bullet_like = input.matches('\n').count() >= 2
+        || input.contains("1.")
+        || input.contains("2.")
+        || input.contains("- ")
+        || input.contains("•");
+    let hit_count = cn_hits.iter().filter(|k| input.contains(**k)).count()
+        + en_hits.iter().filter(|k| lower.contains(**k)).count();
+    lines >= 3 || bullet_like || hit_count >= 3
+}
+
 async fn handle_chat_slash_command(
     input: &str,
     cfg: &mut Config,
@@ -635,6 +904,7 @@ async fn handle_chat_slash_command(
     active_session: &mut String,
     exec_mode: &mut ChatExecutionMode,
     render_markdown: &mut bool,
+    active_skill: &mut Option<String>,
 ) -> Result<()> {
     let mut parts = input.split_whitespace();
     let Some(cmd) = parts.next() else {
@@ -665,11 +935,14 @@ async fn handle_chat_slash_command(
             c("/askfile <file> <question>", "ask about a file");
             c("/list [path]", "list files");
             c("/grep <pattern> [path]", "search files");
+            c("/paste [question]", "paste clipboard image into current turn");
             c("/prompt show", "show active prompt");
             c("/prompt list", "list prompts");
             c("/prompt use <name>", "switch prompt");
             c("/model list", "list available models");
             c("/model use <name>", "switch model");
+            c("/plan show|clear", "show or clear current session plan");
+            c("/skill list|show|use|clear", "manage session skill");
             println!(
                 "{}",
                 color_dim("─────────────────────────────────────────────")
@@ -721,6 +994,8 @@ async fn handle_chat_slash_command(
                     let next_history = load_session_or_default(&next_session)?;
                     *history = next_history;
                     *active_session = next_session.clone();
+                    set_runtime_active_session(Some(active_session));
+                    *active_skill = load_active_skill_for_session(&next_session)?;
                     println!(
                         "Switched session: {} ({} messages)",
                         next_session,
@@ -776,6 +1051,67 @@ async fn handle_chat_slash_command(
         }
         "/status" => {
             print_status(cfg)?;
+            println!(
+                "active_skill: {}",
+                active_skill.as_deref().unwrap_or("(none)")
+            );
+        }
+        "/paste" => {
+            let attachment = match read_clipboard_image_attachment() {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    println!("No image found in clipboard.");
+                    return Ok(());
+                }
+                Err(err) => {
+                    println!("Failed to read clipboard image: {}", err);
+                    return Ok(());
+                }
+            };
+            let mut question = parts.collect::<Vec<_>>().join(" ");
+            if question.trim().is_empty() {
+                let inline = ask("image> ")?;
+                question = inline.trim().to_string();
+            }
+            let prompt = if question.trim().is_empty() {
+                "Please analyze this pasted image.".to_string()
+            } else {
+                question.trim().to_string()
+            };
+            let turn_skill = match active_skill.as_deref() {
+                Some(name) => find_skill(name)?,
+                None => pick_skill_for_input(&prompt)?,
+            };
+            let use_agent = should_use_agent_for_turn(cfg, history, &prompt, *exec_mode)
+                .await
+                .unwrap_or_else(|_| should_use_agent_for_input(&prompt, *exec_mode));
+            let augmented_input = augment_user_input_with_workspace_context(&prompt)?;
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: augmented_input,
+                attachments: vec![attachment],
+            });
+            maybe_compact_history(history, cfg);
+            if use_agent {
+                run_agent_turn(
+                    cfg,
+                    history,
+                    "chat",
+                    Some(active_session),
+                    *render_markdown,
+                    turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+                )
+                .await?;
+            } else {
+                run_chat_turn(
+                    cfg,
+                    history,
+                    "chat-lite",
+                    *render_markdown,
+                    turn_skill.as_ref().map(|s| s.manifest.name.as_str()),
+                )
+                .await?;
+            }
         }
         "/read" => {
             let Some(file) = parts.next() else {
@@ -791,7 +1127,15 @@ async fn handle_chat_slash_command(
                     file
                 );
             } else {
-                submit_file_to_model(cfg, history, &question, file, *render_markdown).await?;
+                submit_file_to_model(
+                    cfg,
+                    history,
+                    &question,
+                    file,
+                    *render_markdown,
+                    active_skill.as_deref(),
+                )
+                .await?;
             }
         }
         "/askfile" => {
@@ -804,7 +1148,15 @@ async fn handle_chat_slash_command(
                 println!("Usage: /askfile <file> <question>");
                 return Ok(());
             }
-            submit_file_to_model(cfg, history, &question, file, *render_markdown).await?;
+            submit_file_to_model(
+                cfg,
+                history,
+                &question,
+                file,
+                *render_markdown,
+                active_skill.as_deref(),
+            )
+            .await?;
         }
         "/list" => {
             let path = parts.next().unwrap_or(".");
@@ -900,6 +1252,83 @@ async fn handle_chat_slash_command(
                 _ => println!("Usage: /model <list|use>"),
             }
         }
+        "/plan" => {
+            let sub = parts.next().unwrap_or("show");
+            match sub {
+                "show" => {
+                    if let Some(plan) = load_plan_for_session(active_session)? {
+                        print!("{}", render_session_plan(&plan));
+                    } else {
+                        println!("No active plan.");
+                    }
+                }
+                "clear" => {
+                    clear_plan_for_session(active_session)?;
+                    println!("Plan cleared.");
+                }
+                _ => println!("Usage: /plan <show|clear>"),
+            }
+        }
+        "/skill" => {
+            let Some(sub) = parts.next() else {
+                println!("Usage: /skill <list|show|use|clear>");
+                return Ok(());
+            };
+            match sub {
+                "list" => {
+                    let skills = load_skills()?;
+                    if skills.is_empty() {
+                        println!("No skills found.");
+                    } else {
+                        for skill in skills {
+                            let mark = if active_skill
+                                .as_deref()
+                                .is_some_and(|v| v.eq_ignore_ascii_case(&skill.manifest.name))
+                            {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            println!("{mark} {}", skill.manifest.name);
+                        }
+                    }
+                }
+                "show" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /skill show <name>");
+                        return Ok(());
+                    };
+                    let Some(skill) = find_skill(name)? else {
+                        println!("Skill not found: {}", name);
+                        return Ok(());
+                    };
+                    println!("Skill: {}", skill.manifest.name);
+                    println!("Description: {}", skill.manifest.description);
+                    if !skill.prompt_text.trim().is_empty() {
+                        println!("Prompt: {}", truncate_preview(&skill.prompt_text, 180));
+                    }
+                }
+                "use" => {
+                    let Some(name) = parts.next() else {
+                        println!("Usage: /skill use <name>");
+                        return Ok(());
+                    };
+                    let Some(skill) = find_skill(name)? else {
+                        println!("Skill not found: {}", name);
+                        return Ok(());
+                    };
+                    save_active_skill_for_session(active_session, Some(&skill.manifest.name))?;
+                    *active_skill = Some(skill.manifest.name.clone());
+                    println!("Active skill switched to '{}'.", skill.manifest.name);
+                }
+                "clear" => {
+                    save_active_skill_for_session(active_session, None)?;
+                    *active_skill = None;
+                    println!("Active skill cleared.");
+                }
+                _ => println!("Usage: /skill <list|show|use|clear>"),
+            }
+        }
         _ => {
             println!("Unknown command: {}. Use /help.", cmd);
         }
@@ -915,6 +1344,36 @@ struct ExecResult {
     had_failures: bool,
     display_text: String,
     history_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PlanItem {
+    step: String,
+    status: PlanItemStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SessionPlan {
+    #[serde(default)]
+    explanation: Option<String>,
+    #[serde(default)]
+    items: Vec<PlanItem>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AutoStopState {
+    consecutive_no_progress: usize,
+    consecutive_repeat: usize,
+    last_tool_signature: Option<String>,
+    final_summary_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1203,6 +1662,31 @@ fn native_tool_schemas() -> Vec<Value> {
                 "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
             }
         }),
+        json!({
+            "type":"function",
+            "function":{
+                "name":"update_plan",
+                "description":"Create or replace the current session plan with ordered items and statuses",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "explanation":{"type":"string"},
+                        "items":{
+                            "type":"array",
+                            "items":{
+                                "type":"object",
+                                "properties":{
+                                    "step":{"type":"string"},
+                                    "status":{"type":"string","enum":["pending","in_progress","completed"]}
+                                },
+                                "required":["step","status"]
+                            }
+                        }
+                    },
+                    "required":["items"]
+                }
+            }
+        }),
     ]
 }
 
@@ -1312,6 +1796,70 @@ fn serialize_tool_results(results: &[ToolResultRecord]) -> String {
     serde_json::to_string_pretty(results).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn tool_call_signature(calls: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for call in calls {
+        let name = call
+            .get("tool")
+            .or_else(|| call.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let args = call
+            .get("args")
+            .or_else(|| call.get("arguments"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if name.is_empty() {
+            continue;
+        }
+        parts.push(format!("{}:{}", name, args));
+    }
+    parts.join("|")
+}
+
+fn should_force_final_summary(
+    state: &mut AutoStopState,
+    steps: usize,
+    changed_files: &[String],
+    signature: &str,
+) -> Option<String> {
+    if changed_files.is_empty() {
+        state.consecutive_no_progress += 1;
+    } else {
+        state.consecutive_no_progress = 0;
+    }
+
+    if !signature.is_empty() && state.last_tool_signature.as_deref() == Some(signature) {
+        state.consecutive_repeat += 1;
+    } else {
+        state.consecutive_repeat = 0;
+    }
+    if !signature.is_empty() {
+        state.last_tool_signature = Some(signature.to_string());
+    }
+
+    if steps >= MAX_AUTO_TOOL_STEPS {
+        return Some(format!(
+            "Tool execution reached the limit ({} steps). Stop using tools and provide the final answer now.",
+            MAX_AUTO_TOOL_STEPS
+        ));
+    }
+    if state.consecutive_no_progress >= MAX_AUTO_NO_PROGRESS_STEPS {
+        return Some(format!(
+            "No meaningful progress was detected for {} consecutive tool rounds. Stop using tools and provide the final answer now.",
+            MAX_AUTO_NO_PROGRESS_STEPS
+        ));
+    }
+    if state.consecutive_repeat >= MAX_AUTO_REPEAT_TOOL_STEPS {
+        return Some(format!(
+            "The same tool calls repeated for {} consecutive rounds. Stop using tools and provide the final answer now.",
+            MAX_AUTO_REPEAT_TOOL_STEPS
+        ));
+    }
+    None
+}
+
 fn is_skipped_tool_output(output: &str) -> bool {
     let lower = output.trim().to_ascii_lowercase();
     lower.starts_with("skipped") || lower.starts_with("skip ")
@@ -1319,6 +1867,19 @@ fn is_skipped_tool_output(output: &str) -> bool {
 
 fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String> {
     let tool = call.tool.trim().to_ascii_lowercase();
+    if let Some(skill) = runtime_active_skill()
+        && !skill.manifest.allowed_tools.is_empty()
+        && !skill
+            .manifest
+            .allowed_tools
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(&tool))
+    {
+        return Ok(format!(
+            "Skipped unsupported tool by active skill '{}': {}",
+            skill.manifest.name, call.tool
+        ));
+    }
     match tool.as_str() {
         "shell" => execute_shell_tool_call(cfg, call),
         "fs.read_file" | "fs_read_file" => execute_native_fs_read(call),
@@ -1330,8 +1891,64 @@ fn execute_tool_call_by_name(cfg: &mut Config, call: &ToolCall) -> Result<String
         "fs.move" | "fs_move" => execute_native_fs_move(call),
         "fs.delete" | "fs_delete" => execute_native_fs_delete(call),
         "run_command" => execute_structured_run_command(cfg, call),
+        "update_plan" => execute_update_plan(call),
         _ => Ok(format!("Skipped unsupported tool: {}", call.tool)),
     }
+}
+
+fn execute_update_plan(call: &ToolCall) -> Result<String> {
+    let Some(session) = runtime_active_session_name() else {
+        return Ok("Skipped update_plan: no active session.".to_string());
+    };
+    let explanation = tool_arg_string(call, &["explanation"]);
+    let items_value = call
+        .args
+        .get("items")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let items = parse_plan_items(&items_value)?;
+    let plan = SessionPlan {
+        explanation,
+        items,
+    };
+    save_plan_for_session(&session, &plan)?;
+    Ok(render_session_plan(&plan))
+}
+
+fn parse_plan_items(value: &Value) -> Result<Vec<PlanItem>> {
+    let Some(items) = value.as_array() else {
+        bail!("update_plan.items must be an array");
+    };
+    if items.len() > 20 {
+        bail!("plan cannot have more than 20 items");
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let step = item
+            .get("step")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("plan item missing step"))?;
+        let status = match item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pending" => PlanItemStatus::Pending,
+            "in_progress" => PlanItemStatus::InProgress,
+            "completed" => PlanItemStatus::Completed,
+            other => bail!("invalid plan status: {}", other),
+        };
+        out.push(PlanItem {
+            step: step.to_string(),
+            status,
+        });
+    }
+    Ok(out)
 }
 
 fn tool_progress_label(call: &ToolCall) -> Option<String> {
@@ -1806,9 +2423,21 @@ async fn run_agent_turn(
     mode: &str,
     session: Option<&str>,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
-    let system = build_system_prompt(cfg, mode);
-    run_agent_turn_with_system(cfg, history, &system, session, render_markdown, true).await
+    let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
+    set_runtime_active_skill(runtime_skill)?;
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let system = build_system_prompt_with_skill(cfg, mode, active_skill, should_suggest_plan(last_user))?;
+    let result =
+        run_agent_turn_with_system(cfg, history, &system, session, render_markdown, true).await;
+    let _ = set_runtime_active_skill(None);
+    result
 }
 
 async fn run_agent_turn_with_system(
@@ -1881,6 +2510,7 @@ async fn run_agent_turn_with_system_native(
     let mut invalid_format_retries = 0usize;
     let mut write_claim_retries = 0usize;
     let mut write_task_retries = 0usize;
+    let mut auto_stop = AutoStopState::default();
     loop {
         compact_native_messages(&mut messages, cfg.history_max_chars.max(2000));
         println!(
@@ -1949,26 +2579,7 @@ async fn run_agent_turn_with_system_native(
                         return Ok(());
                     }
                     record_diagnostic(cfg, "write-hard-fail", err, session);
-                    println!("assistant> {}", err);
-                    return Ok(());
-                }
-                if changed_delta.is_empty() && looks_like_patch_request(last_user) {
-                    let err = "Patch/diff task failed: model did not execute any tool_calls, so no real code diff was produced.";
-                    if try_executor_model_fallback(
-                        cfg,
-                        history,
-                        system,
-                        session,
-                        render_markdown,
-                        err,
-                        allow_executor_fallback,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    record_diagnostic(cfg, "patch-hard-fail", err, session);
-                    println!("assistant> {}", err);
+                    println!("assistant> {}", user_visible_write_fail());
                     return Ok(());
                 }
                 if looks_like_manual_action_answer(&answer)
@@ -1989,12 +2600,13 @@ async fn run_agent_turn_with_system_native(
                         return Ok(());
                     }
                     record_diagnostic(cfg, "manual-delegation-blocked", err, session);
-                    println!("assistant> {}", err);
+                    println!("assistant> {}", user_visible_manual_delegation());
                     return Ok(());
                 }
                 history.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: answer,
+                    attachments: Vec::new(),
                 });
                 return Ok(());
             }
@@ -2012,13 +2624,6 @@ async fn run_agent_turn_with_system_native(
                     )
                 }));
                 steps += 1;
-                if steps >= MAX_AUTO_TOOL_STEPS {
-                    println!(
-                        "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                        MAX_AUTO_TOOL_STEPS
-                    );
-                    return Ok(());
-                }
                 continue;
             }
 
@@ -2051,9 +2656,12 @@ async fn run_agent_turn_with_system_native(
             );
             return Ok(());
         }
-
+        let before_round = current_changed_file_set().unwrap_or_default();
         let (exec_result, tool_msgs) = execute_native_function_calls(cfg, &resp.tool_calls)?;
+        let after_round = current_changed_file_set().unwrap_or_default();
+        let changed_round = changed_files_delta(&before_round, &after_round);
         let native_calls = native_calls_to_values(&resp.tool_calls, cfg, session);
+        let signature = tool_call_signature(&native_calls);
         record_step_artifact_from_native(
             session,
             cfg,
@@ -2085,12 +2693,21 @@ async fn run_agent_turn_with_system_native(
                 )
             }));
             steps += 1;
-            if steps >= MAX_AUTO_TOOL_STEPS {
-                println!(
-                    "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                    MAX_AUTO_TOOL_STEPS
-                );
-                return Ok(());
+            if let Some(stop_msg) =
+                should_force_final_summary(&mut auto_stop, steps, &changed_round, &signature)
+            {
+                if auto_stop.final_summary_requested {
+                    println!("assistant> {}", truncate_with_suffix(&stop_msg, 220, " ..."));
+                    return Ok(());
+                }
+                auto_stop.final_summary_requested = true;
+                messages.push(json!({
+                    "role":"user",
+                    "content": format!(
+                        "{}\nDo not call any more tools. Reply with the final answer only: concise summary, changed files, and verification result.",
+                        stop_msg
+                    )
+                }));
             }
             continue;
         }
@@ -2140,6 +2757,7 @@ async fn run_agent_turn_with_system_legacy(
     let mut invalid_format_retries = 0usize;
     let mut write_claim_retries = 0usize;
     let mut write_task_retries = 0usize;
+    let mut auto_stop = AutoStopState::default();
     loop {
         maybe_compact_history(history, cfg);
         println!(
@@ -2171,7 +2789,10 @@ async fn run_agent_turn_with_system_legacy(
             println!("{}", render_markdown_terminal(&answer, render_markdown));
             println!("\n");
         }
+        let before_round = current_changed_file_set().unwrap_or_default();
         let exec_result = maybe_execute_assistant_commands(cfg, &answer)?;
+        let after_round = current_changed_file_set().unwrap_or_default();
+        let changed_round = changed_files_delta(&before_round, &after_round);
         let last_user = history
             .iter()
             .rev()
@@ -2179,6 +2800,7 @@ async fn run_agent_turn_with_system_legacy(
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let parsed_calls = tool_calls_from_text(&answer);
+        let signature = tool_call_signature(&parsed_calls);
         record_step_artifact(
             session,
             cfg,
@@ -2194,6 +2816,7 @@ async fn run_agent_turn_with_system_legacy(
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer.clone(),
+            attachments: Vec::new(),
         });
 
         if !exec_result.had_blocks {
@@ -2209,6 +2832,7 @@ async fn run_agent_turn_with_system_legacy(
                 history.push(ChatMessage {
                     role: "user".to_string(),
                     content: format!("{msg} {}", STRICT_TOOL_CALL_INSTRUCTION),
+                    attachments: Vec::new(),
                 });
                 continue;
             }
@@ -2228,26 +2852,7 @@ async fn run_agent_turn_with_system_legacy(
                     return Ok(());
                 }
                 record_diagnostic(cfg, "write-hard-fail", err, session);
-                println!("assistant> {}", err);
-                return Ok(());
-            }
-            if changed_delta.is_empty() && looks_like_patch_request(&last_user) {
-                let err = "Patch/diff task failed: model did not execute any tool_calls, so no real code diff was produced.";
-                if try_executor_model_fallback(
-                    cfg,
-                    history,
-                    system,
-                    session,
-                    render_markdown,
-                    err,
-                    allow_executor_fallback,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                record_diagnostic(cfg, "patch-hard-fail", err, session);
-                println!("assistant> {}", err);
+                println!("assistant> {}", user_visible_write_fail());
                 return Ok(());
             }
             if looks_like_manual_action_answer(&answer)
@@ -2268,7 +2873,7 @@ async fn run_agent_turn_with_system_legacy(
                     return Ok(());
                 }
                 record_diagnostic(cfg, "manual-delegation-blocked", err, session);
-                println!("assistant> {}", err);
+                println!("assistant> {}", user_visible_manual_delegation());
                 return Ok(());
             }
             return Ok(());
@@ -2284,14 +2889,25 @@ async fn run_agent_turn_with_system_legacy(
                     verification,
                     recovery_hint
                 ),
+                attachments: Vec::new(),
             });
             steps += 1;
-            if steps >= MAX_AUTO_TOOL_STEPS {
-                println!(
-                    "assistant> Reached auto tool step limit ({}). Continue by describing next action.",
-                    MAX_AUTO_TOOL_STEPS
-                );
-                return Ok(());
+            if let Some(stop_msg) =
+                should_force_final_summary(&mut auto_stop, steps, &changed_round, &signature)
+            {
+                if auto_stop.final_summary_requested {
+                    println!("assistant> {}", truncate_with_suffix(&stop_msg, 220, " ..."));
+                    return Ok(());
+                }
+                auto_stop.final_summary_requested = true;
+                history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: format!(
+                        "{}\nDo not call any more tools. Reply with the final answer only: concise summary, changed files, and verification result.",
+                        stop_msg
+                    ),
+                    attachments: Vec::new(),
+                });
             }
             continue;
         }
@@ -2304,6 +2920,7 @@ async fn run_agent_turn_with_system_legacy(
                     "Your last response had invalid tool_calls format. {}",
                     STRICT_TOOL_CALL_INSTRUCTION
                 ),
+                attachments: Vec::new(),
             });
             continue;
         }
@@ -2316,6 +2933,7 @@ async fn run_agent_turn_with_system_legacy(
                     "Your last response used unsupported execution format or unsafe commands. {}",
                     STRICT_TOOL_CALL_INSTRUCTION
                 ),
+                attachments: Vec::new(),
             });
             continue;
         }
@@ -2476,6 +3094,7 @@ fn looks_like_manual_action_answer(text: &str) -> bool {
         || t.contains("请你自己改")
 }
 
+#[allow(dead_code)]
 fn is_active_relay_provider(cfg: &Config) -> bool {
     cfg.model_profiles
         .get(&cfg.model)
@@ -2483,6 +3102,7 @@ fn is_active_relay_provider(cfg: &Config) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 fn should_force_tool_retry(cfg: &Config, answer: &str) -> bool {
     is_active_relay_provider(cfg)
         || active_effective_tool_mode(cfg) == ToolCallMode::Json
@@ -2522,10 +3142,6 @@ async fn try_executor_model_fallback(
     let before = current_changed_file_set().unwrap_or_default();
     let before_fp = snapshot_file_fingerprints(&before);
     let source_model = cfg.model.clone();
-    println!(
-        "assistant> Primary model '{}' failed execution guard ({}). Trying executor model '{}' ...",
-        source_model, reason, executor_model
-    );
     record_diagnostic(
         cfg,
         "executor-fallback-start",
@@ -2551,7 +3167,6 @@ async fn try_executor_model_fallback(
     if let Err(err) = exec_res {
         let msg = format!("executor model request failed: {}", err);
         record_diagnostic(&exec_cfg, "executor-fallback-failed", &msg, session);
-        println!("assistant> {}", msg);
         return Ok(false);
     }
 
@@ -2562,7 +3177,6 @@ async fn try_executor_model_fallback(
     if delta.is_empty() && !content_changed {
         let msg = "executor fallback finished but still no detectable file changes were produced.";
         record_diagnostic(&exec_cfg, "executor-fallback-no-diff", msg, session);
-        println!("assistant> {}", msg);
         return Ok(false);
     }
 
@@ -2576,7 +3190,6 @@ async fn try_executor_model_fallback(
         "executor fallback succeeded with content changes on existing changed files.".to_string()
     };
     record_diagnostic(&exec_cfg, "executor-fallback-succeeded", &msg, session);
-    println!("assistant> {}", msg);
 
     *cfg = exec_cfg;
     let _ = save_config(cfg);
@@ -2654,8 +3267,17 @@ async fn run_chat_turn(
     history: &mut Vec<ChatMessage>,
     mode: &str,
     render_markdown: bool,
+    active_skill: Option<&str>,
 ) -> Result<()> {
-    let mut system = build_system_prompt(cfg, mode);
+    let runtime_skill = active_skill.and_then(|name| find_skill(name).ok().flatten());
+    set_runtime_active_skill(runtime_skill)?;
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    let mut system = build_system_prompt_with_skill(cfg, mode, active_skill, should_suggest_plan(last_user))?;
     maybe_compact_history(history, cfg);
     println!("{}", color_dim("(phase: response)"));
     print!(
@@ -2700,7 +3322,9 @@ async fn run_chat_turn(
             history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: msg.to_string(),
+                attachments: Vec::new(),
             });
+            let _ = set_runtime_active_skill(None);
             return Ok(());
         }
 
@@ -2711,9 +3335,12 @@ async fn run_chat_turn(
         history.push(ChatMessage {
             role: "assistant".to_string(),
             content: answer,
+            attachments: Vec::new(),
         });
+        let _ = set_runtime_active_skill(None);
         return Ok(());
     }
+    let _ = set_runtime_active_skill(None);
     Ok(())
 }
 
@@ -2760,12 +3387,13 @@ async fn classify_mode_with_llm(
              Request: {input}\n\
              Output JSON only: {{\"mode\":\"agent\"|\"chat\",\"reason\":\"short\"}}"
         ),
+        attachments: Vec::new(),
     });
     let system = "You are a strict mode router for coding assistant.\n\
 Choose \"agent\" when task likely needs repo inspection, filesystem commands, file edits, test/build execution, or multi-step actions.\n\
 Choose \"chat\" for explanation-only or conceptual Q&A.\n\
 Output JSON only.";
-    let out = call_llm_with_history(cfg, system, &router_history).await?;
+    let out = call_llm_with_history_json_object(cfg, system, &router_history).await?;
     Ok(parse_router_mode(&out))
 }
 
@@ -3450,7 +4078,13 @@ fn matches_list(list: &[String], cmd: &str) -> bool {
 }
 
 fn is_trusted_command(cfg: &Config, cmd: &str) -> bool {
-    matches_list(&cfg.auto_exec_trusted, cmd)
+    if matches_list(&cfg.auto_exec_trusted, cmd) {
+        return true;
+    }
+    if let Some(skill) = runtime_active_skill() {
+        return matches_list(&skill.manifest.trusted_commands, cmd);
+    }
+    false
 }
 
 fn command_prefix(cmd: &str) -> String {
@@ -3578,7 +4212,7 @@ fn run_translated_safe_command(cmd: &str) -> Result<Option<String>> {
 }
 
 fn run_windows_grep_translation(cmd: &str) -> Result<String> {
-    let pattern = extract_quoted(cmd).unwrap_or_else(|| "TODO".to_string());
+    let pattern = extract_quoted(cmd).unwrap_or_else(|| ".*".to_string());
     let pattern = pattern.replace("\\|", "|");
     let glob = parse_flag_value(cmd, "--include=").unwrap_or_else(|| "*.txt".to_string());
     let path = if cmd.contains(" . ") || cmd.ends_with(" .") {
@@ -3652,6 +4286,12 @@ fn session_path(session: &str) -> Result<std::path::PathBuf> {
         .join(format!("{session}.json")))
 }
 
+fn plan_path(session: &str) -> Result<std::path::PathBuf> {
+    Ok(config_dir()?
+        .join("sessions")
+        .join(format!("{session}.plan.json")))
+}
+
 fn sessions_dir() -> Result<PathBuf> {
     Ok(config_dir()?.join("sessions"))
 }
@@ -3705,6 +4345,18 @@ fn sanitize_session_name(name: &str) -> String {
     }
 }
 
+fn set_runtime_active_session(session: Option<&str>) {
+    let lock = RUNTIME_ACTIVE_SESSION.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = session.map(|s| s.to_string());
+    }
+}
+
+fn runtime_active_session_name() -> Option<String> {
+    let lock = RUNTIME_ACTIVE_SESSION.get_or_init(|| Mutex::new(None));
+    lock.lock().ok().and_then(|guard| guard.clone())
+}
+
 fn load_session_or_default(session: &str) -> Result<Vec<ChatMessage>> {
     let path = session_path(session)?;
     if !path.exists() {
@@ -3722,6 +4374,58 @@ fn load_session_or_default(session: &str) -> Result<Vec<ChatMessage>> {
         })
         .collect();
     Ok(repaired)
+}
+
+fn load_plan_for_session(session: &str) -> Result<Option<SessionPlan>> {
+    let path = plan_path(session)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let plan: SessionPlan =
+        serde_json::from_str(&text).with_context(|| format!("Invalid plan JSON: {}", path.display()))?;
+    Ok(Some(plan))
+}
+
+fn save_plan_for_session(session: &str, plan: &SessionPlan) -> Result<()> {
+    let path = plan_path(session)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create session dir {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(plan)?;
+    fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn clear_plan_for_session(session: &str) -> Result<()> {
+    let path = plan_path(session)?;
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn render_session_plan(plan: &SessionPlan) -> String {
+    let mut out = String::new();
+    out.push_str("✢ Current Plan\n");
+    if let Some(explanation) = plan.explanation.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!("  {}\n", explanation));
+    }
+    if plan.items.is_empty() {
+        out.push_str("  (empty)\n");
+        return out;
+    }
+    for item in &plan.items {
+        let mark = match item.status {
+            PlanItemStatus::Completed => "◼",
+            PlanItemStatus::InProgress => "✢",
+            PlanItemStatus::Pending => "◻",
+        };
+        out.push_str(&format!("  {} {}\n", mark, item.step));
+    }
+    out
 }
 
 fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
@@ -3745,16 +4449,27 @@ fn save_session(session: &str, messages: &[ChatMessage]) -> Result<()> {
 
 pub async fn run_agent_task(mut cfg: Config, session: &str, task: &str) -> Result<()> {
     let active_session = resolve_session_name(session)?;
+    set_runtime_active_session(Some(&active_session));
     println!("== dongshan agent ({active_session}) ==");
     let mut history = load_session_or_default(&active_session)?;
     let augmented_input = augment_user_input_with_workspace_context(task)?;
     history.push(ChatMessage {
         role: "user".to_string(),
         content: augmented_input,
+        attachments: Vec::new(),
     });
 
     maybe_compact_history(&mut history, &cfg);
-    run_agent_turn(&mut cfg, &mut history, "chat", Some(&active_session), true).await?;
+    let active_skill = load_active_skill_for_session(&active_session)?;
+    run_agent_turn(
+        &mut cfg,
+        &mut history,
+        "chat",
+        Some(&active_session),
+        true,
+        active_skill.as_deref(),
+    )
+    .await?;
     save_session(&active_session, &history)?;
 
     let changed = list_workspace_changed_files()?;
@@ -3779,10 +4494,31 @@ fn print_status(cfg: &Config) -> Result<()> {
     println!("model: {}", cfg.model);
     println!("provider: {}", provider);
     println!("tool_mode: {}", tool_mode);
+    println!("tool_choice_policy: {:?}", cfg.tool_choice_policy);
     println!(
         "executor_model: {}",
         cfg.executor_model.as_deref().unwrap_or("(none)")
     );
+    println!(
+        "fallback_models: {}",
+        if cfg.fallback_models.is_empty() {
+            "(none)".to_string()
+        } else {
+            cfg.fallback_models.join(", ")
+        }
+    );
+    if let Some(session) = runtime_active_session_name() {
+        if let Some(plan) = load_plan_for_session(&session)? {
+            let in_progress = plan
+                .items
+                .iter()
+                .filter(|item| matches!(item.status, PlanItemStatus::InProgress))
+                .count();
+            println!("plan_items: {} (in_progress: {})", plan.items.len(), in_progress);
+        } else {
+            println!("plan_items: 0");
+        }
+    }
     let changed = list_workspace_changed_files()?;
     println!("changed_files: {}", changed.len());
     for p in changed.iter().take(8) {
@@ -4283,4 +5019,83 @@ fn looks_more_readable_chinese(candidate: &str, original: &str) -> bool {
         common * 2 - weird * 2 - replacement * 3
     }
     score(candidate) > score(original)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_call_signature() {
+        let calls = vec![
+            json!({"tool": "read", "args": {"path": "test.rs"}}),
+            json!({"tool": "write", "args": {"path": "out.rs"}}),
+        ];
+        let sig = tool_call_signature(&calls);
+        assert!(sig.contains("read"));
+        assert!(sig.contains("write"));
+    }
+
+    #[test]
+    fn test_should_force_final_summary_max_steps() {
+        let mut state = AutoStopState::default();
+        let result = should_force_final_summary(&mut state, 12, &[], "");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_should_force_final_summary_no_progress() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &[], "sig1");
+        let result = should_force_final_summary(&mut state, 2, &[], "sig2");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_should_force_final_summary_repeat() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &["file.rs".to_string()], "sig");
+        should_force_final_summary(&mut state, 2, &["file.rs".to_string()], "sig");
+        let result = should_force_final_summary(&mut state, 3, &["file.rs".to_string()], "sig");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_command_prefix() {
+        assert_eq!(command_prefix("ls -la"), "ls");
+        assert_eq!(command_prefix("git status"), "git status");
+        assert_eq!(command_prefix("git commit -m 'test'"), "git commit");
+        assert_eq!(command_prefix(""), "");
+    }
+
+    #[test]
+    fn test_parse_plan_items_limit() {
+        let items = (0..21).map(|i| json!({"step": format!("step{}", i)})).collect::<Vec<_>>();
+        let result = parse_plan_items(&json!(items));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("20"));
+    }
+
+    #[test]
+    fn test_parse_plan_items_valid() {
+        let items = vec![
+            json!({"step": "first", "status": "pending"}),
+            json!({"step": "second", "status": "in_progress"}),
+        ];
+        let result = parse_plan_items(&json!(items)).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_call_signature_empty() {
+        assert_eq!(tool_call_signature(&[]), "");
+    }
+
+    #[test]
+    fn test_should_force_final_summary_progress_resets() {
+        let mut state = AutoStopState::default();
+        should_force_final_summary(&mut state, 1, &[], "sig1");
+        let result = should_force_final_summary(&mut state, 2, &["file.rs".to_string()], "sig2");
+        assert!(result.is_none());
+    }
 }

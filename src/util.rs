@@ -100,7 +100,7 @@ pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
         println!(
             "  {}  {}",
             color_bold(&color_rust("dongshan")),
-            color_dim("v0.2.0  ·  AI Coding Assistant")
+            color_dim("v0.2.1  ·  AI Coding Assistant")
         );
         println!("  {}", color_rust(&sep));
         println!("  {}  {}", color_dim("session :"), color_cyan(session));
@@ -115,7 +115,7 @@ pub fn print_startup_banner(session: &str, model: &str, exec_mode: &str) {
         for line in FERRIS.trim_matches('\n').lines() {
             println!("{}", line);
         }
-        println!("  dongshan v0.2.0  ·  AI Coding Assistant");
+        println!("  dongshan v0.2.1  ·  AI Coding Assistant");
         println!("  {}", sep);
         println!(
             "  session : {}  model : {}  mode : {}",
@@ -214,14 +214,14 @@ pub fn render_markdown_terminal(text: &str, enabled: bool) -> String {
             continue;
         }
 
-        if let Some(h) = render_heading(trimmed) {
+        if let Some(h) = render_heading_clean(trimmed) {
             out.push_str(&h);
             out.push('\n');
             continue;
         }
         if let Some(q) = trimmed.strip_prefix(">") {
             out.push_str(&color_dim("▏ "));
-            out.push_str(&style_inline_md(q.trim_start()));
+            out.push_str(&style_inline_md_clean(q.trim_start()));
             out.push('\n');
             continue;
         }
@@ -230,18 +230,112 @@ pub fn render_markdown_terminal(text: &str, enabled: bool) -> String {
             out.push('\n');
             continue;
         }
-        if let Some(li) = render_list_item(trimmed) {
+        if let Some(li) = render_list_item_clean(trimmed) {
             out.push_str(&li);
             out.push('\n');
             continue;
         }
 
-        out.push_str(&style_inline_md(line));
+        out.push_str(&style_inline_md_clean(line));
         out.push('\n');
     }
     out.trim_end_matches('\n').to_string()
 }
 
+fn render_heading_clean(line: &str) -> Option<String> {
+    let mut level = 0usize;
+    for ch in line.chars() {
+        if ch == '#' {
+            level += 1;
+        } else {
+            break;
+        }
+    }
+    if level == 0 {
+        return None;
+    }
+    let text = line[level..].trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    let prefix = match level {
+        1 => "# ",
+        2 => "## ",
+        3 => "### ",
+        _ => "- ",
+    };
+    Some(color_bold(&format!(
+        "{prefix}{}",
+        style_inline_md_clean(text)
+    )))
+}
+
+fn render_list_item_clean(line: &str) -> Option<String> {
+    if let Some(rest) = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+    {
+        return Some(format!("* {}", style_inline_md_clean(rest)));
+    }
+
+    let mut idx = 0usize;
+    let bytes = line.as_bytes();
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > 0 && idx + 1 < bytes.len() && bytes[idx] == b'.' && bytes[idx + 1] == b' ' {
+        let rest = &line[idx + 2..];
+        return Some(format!("{}. {}", &line[..idx], style_inline_md_clean(rest)));
+    }
+    None
+}
+
+fn style_inline_md_clean(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code = false;
+    let mut in_bold = false;
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = 0usize;
+    let mut buf = String::new();
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '`' {
+            flush_md_segment_clean(&mut out, &mut buf, in_code, in_bold);
+            in_code = !in_code;
+            idx += 1;
+            continue;
+        }
+        if !in_code && ch == '*' && idx + 1 < chars.len() && chars[idx + 1] == '*' {
+            flush_md_segment_clean(&mut out, &mut buf, in_code, in_bold);
+            in_bold = !in_bold;
+            idx += 2;
+            continue;
+        }
+        buf.push(ch);
+        idx += 1;
+    }
+
+    flush_md_segment_clean(&mut out, &mut buf, in_code, in_bold);
+    out
+}
+
+fn flush_md_segment_clean(out: &mut String, buf: &mut String, in_code: bool, in_bold: bool) {
+    if buf.is_empty() {
+        return;
+    }
+    if in_code {
+        out.push_str(&color_cyan(buf));
+    } else if in_bold {
+        out.push_str(&color_bold(buf));
+    } else {
+        out.push_str(buf);
+    }
+    buf.clear();
+}
+
+#[allow(dead_code)]
 fn render_heading(line: &str) -> Option<String> {
     let mut level = 0usize;
     for ch in line.chars() {
@@ -267,6 +361,7 @@ fn render_heading(line: &str) -> Option<String> {
     Some(color_bold(&format!("{prefix}{}", style_inline_md(text))))
 }
 
+#[allow(dead_code)]
 fn render_list_item(line: &str) -> Option<String> {
     if let Some(rest) = line
         .strip_prefix("- ")
@@ -296,6 +391,7 @@ fn is_hr(line: &str) -> bool {
     t.chars().all(|c| c == '-' || c == '*' || c == '_')
 }
 
+#[allow(dead_code)]
 fn style_inline_md(text: &str) -> String {
     let mut out = String::new();
     let mut in_code = false;
@@ -406,3 +502,4 @@ impl Drop for WorkingStatus {
         }
     }
 }
+

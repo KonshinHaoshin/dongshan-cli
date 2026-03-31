@@ -1,2 +1,12 @@
 /target
 .claude
+/npm/vendor
+node_modules/
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package.json
+/npm
+study/

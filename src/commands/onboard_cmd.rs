@@ -18,7 +18,6 @@ pub async fn run_onboard() -> Result<()> {
     let mut cfg = load_config_or_default()?;
     let mut custom_provider: Option<ModelApiProvider> = None;
     let mut custom_base_url: Option<String> = None;
-    let mut custom_api_key_env: Option<String> = None;
     let mut entered_api_key: Option<String> = None;
 
     println!("== dongshan onboard ==");
@@ -72,14 +71,6 @@ pub async fn run_onboard() -> Result<()> {
             }
             custom_base_url = Some(cfg.base_url.clone());
 
-            let api_key_env = ask(&tagged_prompt(
-                "onboard",
-                &format!("API key env var (default {}): ", cfg.api_key_env),
-            ))?;
-            if !api_key_env.trim().is_empty() {
-                cfg.api_key_env = api_key_env.trim().to_string();
-            }
-            custom_api_key_env = Some(cfg.api_key_env.clone());
             None
         }
         _ => {
@@ -157,7 +148,7 @@ pub async fn run_onboard() -> Result<()> {
             &mut cfg,
             &selected_model,
             custom_base_url,
-            custom_api_key_env,
+            None,
             entered_api_key,
             Some(provider),
         );
